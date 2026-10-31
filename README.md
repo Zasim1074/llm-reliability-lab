@@ -94,7 +94,7 @@ For the web app, set `NEXT_PUBLIC_API_BASE_URL` to the HTTPS API origin plus `/a
 
 ## Docker
 
-Docker Compose setup and test instructions are in [docs/docker.md](docs/docker.md). Local SQLite startup uses `docker compose up --build`; optional PostgreSQL is enabled with `docker compose --profile postgres up --build`. The Compose setup and images have not been executed in this environment because Docker is unavailable here.
+Docker Compose setup and test instructions are in [docs/docker.md](docs/docker.md). Local SQLite startup uses `docker compose up --build`; optional PostgreSQL uses `docker compose -f docker-compose.yml -f docker-compose.postgres.yml --profile postgres up --build`. The Compose setup and images have not been executed in this environment because Docker is unavailable here.
 
 ## Verification
 

@@ -1,4 +1,5 @@
 import sqlite3
+import pytest
 
 from app.models import CacheEntry, EvaluationRecord, Experiment, SecurityRecord
 from sqlalchemy import event, func, select
@@ -133,6 +134,21 @@ def test_rate_limiter_is_bounded_and_applies_retry_window():
     limiter.allow("two", now=3)
     limiter.allow("three", now=3)
     assert len(limiter.clients) == 2
+
+
+def test_production_configuration_requires_postgresql_and_database_ssl_option():
+    from pydantic import ValidationError
+    from app.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, demo_mode=False, app_access_token="x" * 40,
+                 llm_provider="openai", openai_api_key="test", database_url="sqlite:///production.db")
+
+    configured = Settings(_env_file=None, demo_mode=False, app_access_token="x" * 40,
+                          llm_provider="openai", openai_api_key="test",
+                          database_url="postgresql+psycopg://user:pass@db:5432/app",
+                          database_ssl_mode="require")
+    assert configured.database_ssl_mode == "require"
 
 
 def test_declared_body_size_limit_returns_request_id(api_client, monkeypatch):

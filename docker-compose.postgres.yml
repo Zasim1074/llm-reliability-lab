@@ -1,0 +1,7 @@
+# Optional override that starts PostgreSQL before API migrations.
+# Use with: docker compose -f docker-compose.yml -f docker-compose.postgres.yml --profile postgres up
+services:
+  api:
+    depends_on:
+      db:
+        condition: service_healthy
