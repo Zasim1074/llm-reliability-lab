@@ -58,6 +58,8 @@ alembic upgrade head
 
 `alembic.ini` and the migration environment read the configured database URL. SQLite is suitable for local demo use. Configure managed PostgreSQL and install a compatible PostgreSQL DBAPI driver before production use. Keep secrets in the hosting provider's environment configuration.
 
+Existing local databases created by the app's startup `create_all` have no Alembic revision marker. Back up the database, verify its schema against the migration, then run `alembic stamp head` once to establish the existing schema's revision. Use `alembic upgrade head` for a fresh database or a database that already has Alembic history. Do not run `upgrade head` against an unversioned database that already contains these tables.
+
 ## Tests and build
 
 ```bash

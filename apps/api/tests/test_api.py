@@ -16,6 +16,13 @@ def test_health_and_cache_round_trip(api_client):
     assert lookup.json()["hit"] is True
 
 
+def test_experiment_summary_route_is_not_captured_as_an_id(api_client):
+    client, _ = api_client
+    summary = client.get("/api/v1/experiments/summary")
+    assert summary.status_code == 200
+    assert summary.json()["total_experiments"] == 0
+
+
 def test_evaluation_and_security_are_persisted(api_client):
     client, test_engine = api_client
     evaluation = client.post("/api/v1/evaluations", json={"prompt": "Explain caching", "candidate": "Caching reduces repeat calls"})

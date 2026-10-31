@@ -230,6 +230,26 @@ def list_experiments(type: Optional[str] = None, status: Optional[str] = None,
              "started_at": r.started_at.isoformat(), "completed_at": r.completed_at.isoformat()} for r in rows]
 
 
+@app.get("/api/v1/experiments/summary")
+def summary(db: Session = Depends(get_db)):
+    experiments = db.scalars(select(Experiment)).all()
+    benchmark_runs = [e for e in experiments if e.type == "benchmark"]
+    evaluations = [e for e in experiments if e.type == "evaluation"]
+    security = [e for e in experiments if e.type == "security"]
+    latest = lambda rows: max(rows, key=lambda row: row.started_at) if rows else None
+    latest_benchmark = latest(benchmark_runs)
+    latest_evaluation = latest(evaluations)
+    latest_security = latest(security)
+    recent = sorted(experiments, key=lambda row: row.started_at, reverse=True)[:8]
+    return {"total_experiments": len(experiments),
+            "cache_hit_rate": latest_benchmark.metrics.get("hit_rate") if latest_benchmark else None,
+            "estimated_avoided_calls": sum(e.metrics.get("estimated_avoided_calls", 0) for e in benchmark_runs),
+            "average_cache_latency_ms": latest_benchmark.metrics.get("average_lookup_latency_ms") if latest_benchmark else None,
+            "latest_evaluation_score": latest_evaluation.metrics.get("overall_score") if latest_evaluation else None,
+            "rag_attack_success_rate": latest_security.metrics.get("attack_success_rate") if latest_security else None,
+            "recent": [{"id": e.id, "type": e.type, "name": e.name, "status": e.status, "started_at": e.started_at.isoformat()} for e in recent]}
+
+
 @app.get("/api/v1/experiments/{experiment_id}")
 def experiment_detail(experiment_id: str, db: Session = Depends(get_db)):
     row = db.get(Experiment, experiment_id)
@@ -237,21 +257,6 @@ def experiment_detail(experiment_id: str, db: Session = Depends(get_db)):
     return {"id": row.id, "type": row.type, "name": row.name, "status": row.status, "configuration": row.configuration,
             "dataset_ref": row.dataset_ref, "metrics": row.metrics, "results": row.results, "error": row.error,
             "started_at": row.started_at.isoformat(), "completed_at": row.completed_at.isoformat()}
-
-
-@app.get("/api/v1/experiments/summary")
-def summary(db: Session = Depends(get_db)):
-    experiments = db.scalars(select(Experiment)).all()
-    benchmark_runs = [e for e in experiments if e.type == "benchmark"]
-    evaluations = [e for e in experiments if e.type == "evaluation"]
-    security = [e for e in experiments if e.type == "security"]
-    cache_hits = [e.metrics.get("hit_rate", 0) for e in benchmark_runs]
-    return {"total_experiments": len(experiments), "cache_hit_rate": cache_hits[-1] if cache_hits else None,
-            "estimated_avoided_calls": sum(e.metrics.get("estimated_avoided_calls", 0) for e in benchmark_runs),
-            "average_cache_latency_ms": benchmark_runs[-1].metrics.get("average_lookup_latency_ms") if benchmark_runs else None,
-            "latest_evaluation_score": evaluations[-1].metrics.get("overall_score") if evaluations else None,
-            "rag_attack_success_rate": security[-1].metrics.get("attack_success_rate") if security else None,
-            "recent": [{"id": e.id, "type": e.type, "name": e.name, "status": e.status, "started_at": e.started_at.isoformat()} for e in sorted(experiments, key=lambda item: item.started_at, reverse=True)[:8]]}
 
 
 @app.delete("/api/v1/experiments/{experiment_id}", status_code=204)

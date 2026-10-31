@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 
 const API =
   process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
+const inFlightGets = new Map<string, Promise<unknown>>();
 const nav = [
   "Overview",
   "Semantic Cache",
@@ -33,15 +34,31 @@ type Summary = {
 };
 
 async function api(path: string, init?: RequestInit) {
-  const response = await fetch(`${API}${path}`, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
-  });
-  if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Request failed (${response.status})`);
+  const method = (init?.method || "GET").toUpperCase();
+  const headers = new Headers(init?.headers);
+  headers.set("Accept", "application/json");
+  if (init?.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
   }
-  return response.status === 204 ? null : response.json();
+  const existing = method === "GET" ? inFlightGets.get(path) : undefined;
+  if (existing) return existing;
+
+  const request = (async () => {
+    const response = await fetch(`${API}${path}`, { ...init, method, headers });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error(body?.detail || `Request failed (${response.status})`);
+    }
+    return response.status === 204 ? null : response.json();
+  })();
+  if (method === "GET") inFlightGets.set(path, request);
+  try {
+    return await request;
+  } finally {
+    if (method === "GET" && inFlightGets.get(path) === request) {
+      inFlightGets.delete(path);
+    }
+  }
 }
 
 function Icon({ children }: { children: React.ReactNode }) {
@@ -82,12 +99,9 @@ export default function Home() {
     setLoading(true);
     setError("");
     try {
-      const [s, e] = await Promise.all([
-        api("/experiments/summary"),
-        api("/experiments?limit=50"),
-      ]);
+      const s = (await api("/experiments/summary")) as Summary;
       setSummary(s);
-      setExperiments(e);
+      setExperiments(s.recent || []);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unable to reach the API");
     } finally {
@@ -99,13 +113,10 @@ export default function Home() {
     const load = async () => {
       setError("");
       try {
-        const [s, e] = await Promise.all([
-          api("/experiments/summary"),
-          api("/experiments?limit=50"),
-        ]);
+        const s = (await api("/experiments/summary")) as Summary;
         if (active) {
           setSummary(s);
-          setExperiments(e);
+          setExperiments(s.recent || []);
         }
       } catch (e) {
         if (active)
@@ -120,7 +131,31 @@ export default function Home() {
     };
   }, []);
 
-  const act = async (action: () => Promise<unknown>, message: string) => {
+  useEffect(() => {
+    if (active !== "Experiment History") return;
+    let current = true;
+    setLoading(true);
+    api("/experiments?limit=50")
+      .then((items) => {
+        if (current) setExperiments(items as RecordItem[]);
+      })
+      .catch((e: unknown) => {
+        if (current)
+          setError(e instanceof Error ? e.message : "Unable to load experiments");
+      })
+      .finally(() => {
+        if (current) setLoading(false);
+      });
+    return () => {
+      current = false;
+    };
+  }, [active]);
+
+  const act = async (
+    action: () => Promise<unknown>,
+    message: string,
+    refreshSummary = true,
+  ) => {
     setError("");
     setNotice("");
     try {
@@ -128,7 +163,7 @@ export default function Home() {
       if (value && typeof value === "object")
         setResult(value as Record<string, unknown>);
       setNotice(message);
-      await refresh();
+      if (refreshSummary) await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "The operation failed");
     }
@@ -163,6 +198,7 @@ export default function Home() {
           body: JSON.stringify({ query, response, namespace }),
         }),
       "Response stored in the cache.",
+      false,
     );
   const evaluate = () =>
     act(
@@ -409,7 +445,7 @@ export default function Home() {
                       className="button primary"
                       disabled={!query.trim()}
                       onClick={() =>
-                        void act(runCache, "Cache lookup complete.")
+                        void act(runCache, "Cache lookup complete.", false)
                       }
                     >
                       Look up query <span>→</span>
@@ -699,7 +735,7 @@ export default function Home() {
                   return;
                 await act(async () => {
                   await api("/cache", { method: "DELETE" });
-                  await api("/experiments/reset", { method: "DELETE" });
+                  await api("/experiments", { method: "DELETE" });
                   return true;
                 }, "Demo data cleared.");
               }}
