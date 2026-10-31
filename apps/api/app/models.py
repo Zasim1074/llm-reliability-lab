@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import uuid4
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, JSON, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -31,10 +32,10 @@ class Experiment(Base):
     name: Mapped[str] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(20), index=True, default="completed")
     configuration: Mapped[dict] = mapped_column(JSON, default=dict)
-    dataset_ref: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    dataset_ref: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     metrics: Mapped[dict] = mapped_column(JSON, default=dict)
     results: Mapped[dict] = mapped_column(JSON, default=dict)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
@@ -43,7 +44,7 @@ class EvaluationRecord(Base):
     __tablename__ = "evaluation_records"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     prompt: Mapped[str] = mapped_column(Text)
-    reference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reference: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     candidate: Mapped[str] = mapped_column(Text)
     scores: Mapped[dict] = mapped_column(JSON)
     overall: Mapped[float] = mapped_column(Float)

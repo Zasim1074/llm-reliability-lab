@@ -2,12 +2,13 @@ import math
 import re
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import CacheEntry, EvaluationRecord, Experiment, SecurityRecord
+from app.models import CacheEntry, Experiment
 
 
 def normalize(text: str) -> str:
@@ -28,14 +29,19 @@ def demo_embedding(text: str, dimensions: int = 96) -> list[float]:
 def cosine(left: list[float], right: list[float]) -> float:
     if not left or len(left) != len(right):
         return -1.0
+    if any(not math.isfinite(value) for value in left + right):
+        return -1.0
     return sum(a * b for a, b in zip(left, right))
 
 
-def create_experiment(db: Session, kind: str, name: str, config: dict, metrics: dict, results: dict, dataset_ref: str | None = None) -> Experiment:
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def create_experiment(db: Session, kind: str, name: str, config: dict, metrics: dict, results: dict, dataset_ref: Optional[str] = None) -> Experiment:
     record = Experiment(type=kind, name=name, configuration=config, metrics=metrics, results=results, dataset_ref=dataset_ref)
     db.add(record)
-    db.commit()
-    db.refresh(record)
+    db.flush()
     return record
 
 
@@ -45,14 +51,15 @@ def cache_lookup(db: Session, query: str, namespace: str) -> dict:
     if not norm_query:
         return {"hit": False, "match_type": None, "score": 0, "response": None, "latency_ms": 0}
     now = datetime.now(timezone.utc)
-    entries = db.scalars(select(CacheEntry).where(CacheEntry.namespace == namespace, CacheEntry.invalidated.is_(False), CacheEntry.expires_at > now)).all()
-    exact = next((entry for entry in entries if entry.normalized_query == norm_query), None)
+    entries = db.scalars(select(CacheEntry).where(CacheEntry.namespace == namespace, CacheEntry.invalidated.is_(False))).all()
+    entries = [entry for entry in entries if _as_utc(entry.expires_at) > now]
+    exact = next((entry for entry in reversed(entries) if entry.normalized_query == norm_query), None)
     if exact:
         match, score = exact, 1.0
         match_type = "exact"
     else:
         query_vec = demo_embedding(norm_query)
-        scored = [(cosine(query_vec, entry.embedding), entry) for entry in entries]
+        scored = [(cosine(query_vec, entry.embedding if isinstance(entry.embedding, list) else []), entry) for entry in entries]
         score, match = max(scored, default=(-1.0, None), key=lambda item: item[0])
         match_type = "similarity"
         if match is None or score < settings.cache_similarity_threshold:
@@ -66,7 +73,7 @@ def cache_lookup(db: Session, query: str, namespace: str) -> dict:
     }
 
 
-def cache_store(db: Session, query: str, response: str, namespace: str, ttl_seconds: int | None = None) -> CacheEntry:
+def cache_store(db: Session, query: str, response: str, namespace: str, ttl_seconds: Optional[int] = None) -> CacheEntry:
     if not normalize(query) or not response.strip():
         raise ValueError("Query and response must not be empty")
     ttl = ttl_seconds or settings.cache_ttl_seconds
@@ -78,7 +85,7 @@ def cache_store(db: Session, query: str, response: str, namespace: str, ttl_seco
     return record
 
 
-def evaluate(prompt: str, candidate: str, reference: str | None) -> dict:
+def evaluate(prompt: str, candidate: str, reference: Optional[str]) -> dict:
     candidate_words = set(re.findall(r"[a-z0-9]+", candidate.lower()))
     prompt_words = set(re.findall(r"[a-z0-9]+", prompt.lower()))
     reference_words = set(re.findall(r"[a-z0-9]+", (reference or "").lower()))

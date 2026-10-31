@@ -1,7 +1,9 @@
 import csv
 import io
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -13,8 +15,20 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import Base, engine, get_db
 from app.models import CacheEntry, EvaluationRecord, Experiment, SecurityRecord
-from app.schemas import CacheLookupRequest, CacheStoreRequest, EvaluationRequest, SecurityRunRequest
-from app.services import cache_lookup, cache_store, create_experiment, evaluate, run_security
+from app.schemas import (
+    CacheLookupRequest,
+    CacheStoreRequest,
+    EvaluationRequest,
+    SecurityRunRequest,
+)
+from app.services import (
+    cache_lookup,
+    cache_store,
+    create_experiment,
+    evaluate,
+    normalize,
+    run_security,
+)
 
 
 @asynccontextmanager
@@ -31,6 +45,9 @@ app.add_middleware(CORSMiddleware, allow_origins=settings.allowed_origins, allow
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
     request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
+    if int(request.headers.get("content-length", "0") or 0) > 1_000_000:
+        return Response(content='{"detail":"Request body exceeds 1 MB limit"}', status_code=413, media_type="application/json",
+                        headers={"X-Request-ID": request.state.request_id})
     response = await call_next(request)
     response.headers["X-Request-ID"] = request.state.request_id
     return response
@@ -58,18 +75,29 @@ def store_cache(payload: CacheStoreRequest, db: Session = Depends(get_db)):
 @app.get("/api/v1/cache/stats")
 def cache_stats(db: Session = Depends(get_db)):
     total = db.scalar(select(func.count(CacheEntry.id)).where(CacheEntry.invalidated.is_(False))) or 0
-    active = db.scalar(select(func.count(CacheEntry.id)).where(CacheEntry.invalidated.is_(False), CacheEntry.expires_at > datetime.now(timezone.utc))) or 0
+    rows = db.scalars(select(CacheEntry).where(CacheEntry.invalidated.is_(False))).all()
+    active = sum(1 for row in rows if (row.expires_at.replace(tzinfo=timezone.utc) if row.expires_at.tzinfo is None else row.expires_at) > datetime.now(timezone.utc))
     return {"entries": total, "active_entries": active, "embedding_provider": "demo_feature_hash", "semantic_embedding": False}
 
 
 @app.delete("/api/v1/cache")
-def clear_cache(namespace: str | None = Query(default=None), db: Session = Depends(get_db)):
+def clear_cache(namespace: Optional[str] = Query(default=None), db: Session = Depends(get_db)):
     query = select(CacheEntry).where(CacheEntry.invalidated.is_(False))
     if namespace: query = query.where(CacheEntry.namespace == namespace)
     rows = db.scalars(query).all()
     for row in rows: row.invalidated = True
     db.commit()
     return {"invalidated": len(rows)}
+
+
+@app.delete("/api/v1/cache/{entry_id}")
+def invalidate_cache_entry(entry_id: str, db: Session = Depends(get_db)):
+    row = db.get(CacheEntry, entry_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Cache entry not found")
+    row.invalidated = True
+    db.commit()
+    return {"invalidated": True}
 
 
 @app.post("/api/v1/benchmarks")
@@ -84,14 +112,33 @@ def benchmark(payload: CacheLookupRequest, db: Session = Depends(get_db)):
             if result["match_type"] == "exact": exact += 1
             else: similarity += 1
     ordered = sorted(latencies)
+    active_entries = db.scalars(select(CacheEntry).where(CacheEntry.namespace == payload.namespace, CacheEntry.invalidated.is_(False))).all()
+    active_entries = [row for row in active_entries if (row.expires_at.replace(tzinfo=timezone.utc) if row.expires_at.tzinfo is None else row.expires_at) > datetime.now(timezone.utc)]
+    exact_latencies, exact_hits = [], 0
+    for query in dataset:
+        started = time.perf_counter()
+        exact_hits += int(any(row.normalized_query == normalize(query) for row in active_entries))
+        exact_latencies.append((time.perf_counter() - started) * 1000)
+    disabled_hits = 0
     metrics = {"total_requests": len(dataset), "cache_hits": hits, "cache_misses": len(dataset) - hits,
                "exact_hits": exact, "similarity_hits": similarity, "hit_rate": round(hits / len(dataset) * 100, 1),
+               "modes": {"disabled": {"hits": disabled_hits, "hit_rate": 0, "simulated_llm_calls": len(dataset), "average_lookup_latency_ms": 0},
+                         "exact": {"hits": exact_hits, "hit_rate": round(exact_hits / len(dataset) * 100, 1),
+                                   "simulated_llm_calls": len(dataset) - exact_hits,
+                                   "average_lookup_latency_ms": round(sum(exact_latencies) / len(exact_latencies), 3),
+                                   "median_lookup_latency_ms": round(sorted(exact_latencies)[(len(exact_latencies)-1)//2], 3)},
+                         "similarity": {"hits": hits, "hit_rate": round(hits / len(dataset) * 100, 1),
+                                        "simulated_llm_calls": len(dataset) - hits,
+                                        "average_lookup_latency_ms": round(sum(latencies) / len(latencies), 3),
+                                        "median_lookup_latency_ms": round((ordered[(len(ordered)-1)//2] + ordered[len(ordered)//2]) / 2, 3)}},
                "average_lookup_latency_ms": round(sum(latencies) / len(latencies), 3),
-               "median_lookup_latency_ms": round(ordered[len(ordered)//2], 3),
+               "median_lookup_latency_ms": round((ordered[(len(ordered)-1)//2] + ordered[len(ordered)//2]) / 2, 3),
                "llm_calls_with_cache": len(dataset) - hits, "llm_calls_without_cache": len(dataset),
                "estimated_avoided_calls": hits, "estimated_cost_avoided_usd": round(hits * 0.002, 4),
                "cost_assumption_usd_per_call": 0.002, "measurement_note": "Lookup latency measured locally; avoided calls and cost are estimates."}
     exp = create_experiment(db, "benchmark", "Semantic cache benchmark", {"namespace": payload.namespace, "cache_mode": "similarity"}, metrics, {"queries": dataset})
+    db.commit()
+    db.refresh(exp)
     return {"experiment_id": exp.id, "metrics": metrics}
 
 
@@ -104,6 +151,8 @@ def evaluation(payload: EvaluationRequest, db: Session = Depends(get_db)):
     exp = create_experiment(db, "evaluation", "Response quality evaluation", {"judge": result["judge"]},
                             {"overall_score": result["overall"], "criteria": result["scores"]}, result)
     db.commit()
+    db.refresh(record)
+    db.refresh(exp)
     return {"id": record.id, "experiment_id": exp.id, **result}
 
 
@@ -143,6 +192,8 @@ def bias_test(payload: EvaluationRequest, db: Session = Depends(get_db)):
               "repeatability": {"scores": [original["overall"], repeat["overall"]], "variance": 0.0},
               "judge": "deterministic_heuristic", "limitation": "Small deterministic rubric checks are diagnostic only, not statistically significant findings."}
     exp = create_experiment(db, "bias", "Judge bias diagnostic", {"judge": "deterministic_heuristic"}, result, result)
+    db.commit()
+    db.refresh(exp)
     return {"experiment_id": exp.id, **result}
 
 
@@ -154,6 +205,8 @@ def security_run(payload: SecurityRunRequest, db: Session = Depends(get_db)):
     db.add(record)
     exp = create_experiment(db, "security", payload.name, {"mitigation": payload.mitigation}, data["metrics"], data)
     db.commit()
+    db.refresh(record)
+    db.refresh(exp)
     return {"id": record.id, "experiment_id": exp.id, **data}
 
 
@@ -166,7 +219,7 @@ def security_samples():
 
 
 @app.get("/api/v1/experiments")
-def list_experiments(type: str | None = None, status: str | None = None,
+def list_experiments(type: Optional[str] = None, status: Optional[str] = None,
                      limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
     query = select(Experiment)
     if type: query = query.where(Experiment.type == type)
@@ -208,3 +261,10 @@ def delete_experiment(experiment_id: str, db: Session = Depends(get_db)):
     db.delete(row)
     db.commit()
     return Response(status_code=204)
+
+
+@app.delete("/api/v1/experiments")
+def clear_experiments(db: Session = Depends(get_db)):
+    count = db.query(Experiment).delete(synchronize_session=False)
+    db.commit()
+    return {"deleted": count}
