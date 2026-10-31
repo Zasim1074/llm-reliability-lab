@@ -16,6 +16,7 @@ class CacheStoreRequest(CacheLookupRequest):
 class EvaluationRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=10000)
     candidate: str = Field(min_length=1, max_length=20000)
+    alternative_candidate: Optional[str] = Field(default=None, max_length=20000)
     reference: Optional[str] = Field(default=None, max_length=20000)
 
 

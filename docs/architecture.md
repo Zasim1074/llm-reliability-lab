@@ -1,42 +1,55 @@
-# Architecture and technical boundaries
+# Architecture and operational boundaries
 
-The project is a modular monolith. Next.js owns presentation and calls a centralized browser API helper. FastAPI owns validation, HTTP errors, and versioned routes. Use-case functions in `app/services.py` implement cache, deterministic rubric, injection classification, and experiment creation. SQLAlchemy models and session setup own persistence. Provider work is isolated from route concerns; this first deliverable registers only explicitly labeled deterministic demo behavior.
+The project is a modular monolith. Next.js owns presentation and a centralized browser API helper. FastAPI owns validation, request IDs, access-token checks, rate limiting, provider lifecycle, and versioned routes. Use-case functions in `app/services.py` implement cache behavior, scoring, injection classification, and experiment creation. SQLAlchemy models and Alembic own persistence and schema evolution. `app/providers.py` isolates OpenAI HTTP calls from routes.
 
 ```mermaid
 flowchart LR
   U[Engineer] --> W[Next.js dashboard]
-  W -->|typed JSON requests /api/v1| A[FastAPI routes]
+  W -->|JSON plus optional bearer token| A[FastAPI]
   A --> S[Application services]
-  S --> C[Demo feature-hash cache]
-  S --> J[Deterministic evaluation rubric]
-  S --> R[Prompt-injection policy harness]
-  S --> E[Shared experiment history]
-  E --> D[(SQLAlchemy persistence)]
-  C --> D
+  S --> C[Exact cache and provider embeddings]
+  S --> J[Demo rubric or structured LLM judge]
+  S --> R[Pattern-based injection harness]
+  C --> D[(SQLAlchemy persistence)]
   J --> D
   R --> D
-  D --> DB[(SQLite local / PostgreSQL configured)]
+  D --> DB[(SQLite local / PostgreSQL hosted)]
+  J -->|configured requests| P[OpenAI API]
+  C -->|configured embeddings| P
 ```
+
+## Important request paths
+
+- Cache rows can contain no embedding (exact-only mode) or a provider embedding with a model identifier. Similarity comparisons only use rows created by the currently selected embedding model. Expired and invalidated rows are excluded; SQL candidate retrieval is capped by `CACHE_SCAN_LIMIT`.
+- Evaluation and pairwise bias calls use structured output from the selected provider. Demo mode uses explicit deterministic heuristics. Provider timeouts and upstream failures become safe 504/502 responses; the API does not log request content or provider error bodies.
+- A security run inserts one `SecurityRecord` and one `Experiment` in one database transaction. Session dependencies roll back exceptions and always close sessions.
+- Application logs are JSON request events containing request ID, method, path, status, duration, and exception class. Readiness probes check a database connection; liveness remains independent of the database.
+- Browser GET requests are deduplicated while identical requests are in flight. The initial overview uses the summary endpoint's recent records; history and settings are fetched only when opened.
 
 ## API surface
 
-- `GET /api/v1/health`
+- `GET /api/v1/health`, `GET /api/v1/ready`, `GET /api/v1/settings`
 - `POST /api/v1/cache/lookup`, `POST /api/v1/cache`, `GET /api/v1/cache/stats`, `DELETE /api/v1/cache`, `DELETE /api/v1/cache/{entry_id}`
 - `POST /api/v1/benchmarks`
-- `POST /api/v1/evaluations`, `GET /api/v1/evaluations`, `GET /api/v1/evaluations/export?format=json|csv`
+- `POST /api/v1/evaluations`, `GET /api/v1/evaluations`, `GET /api/v1/evaluations/export?format=json|csv&limit=200&offset=0`
 - `POST /api/v1/bias-tests`
 - `GET /api/v1/security/sample-cases`, `POST /api/v1/security/runs`
 - `GET /api/v1/experiments`, `GET /api/v1/experiments/summary`, `GET /api/v1/experiments/{id}`, `DELETE /api/v1/experiments`, `DELETE /api/v1/experiments/{id}`
+- `DELETE /api/v1/settings/demo-data`
 
-FastAPI publishes OpenAPI at `/docs` and `/openapi.json`. Requests have an `X-Request-ID` response header. API payloads are capped at 1 MB and schemas constrain individual text fields.
+FastAPI publishes OpenAPI at `/docs` and `/openapi.json`. Non-demo API routes require a shared bearer token. Health and readiness endpoints are exempt so infrastructure probes can access them.
 
-## Limitations and next work
+## Schema and operations
 
-1. Add real embedding and LLM adapters with timeouts, secret handling, provider health checks, and test doubles before using provider-backed results.
-2. Replace demo feature hashing with a documented local embedding model or hosted vector store; the current token-feature projection is not semantic understanding.
-3. Complete the benchmark's disabled and exact-only baselines using independent request paths and add a configurable dataset/pricing profile.
-4. Implement versioned persistent evaluation datasets, compare outputs, richer rubric calibration, and repeated judge configurations.
-5. Harden security classification with a maintained attack corpus and measured false-positive/negative ground truth. The current pattern detector is intentionally small.
-6. Add bounded rate limiting, authentication for public deployment, and production request logging/metrics. Current body size and CORS restrictions do not constitute full public-service protection.
-7. Add frontend automated tests and richer charts; current dashboard avoids fabricating values and exposes stored run metrics.
-8. Validate migrations and PostgreSQL behavior against the target hosting service before launch.
+Alembic revision `0001_initial` creates the original schema. `0002_provider_cache` allows exact-only cache entries and adds embedding model provenance. Existing unversioned databases must be backed up, verified against revision 0001, stamped at that revision, and upgraded. Production startup does not call `create_all`; it fails fast if the cache schema is outdated. Local demo startup creates missing SQLite tables only.
+
+The application limiter is bounded but process-local. Multiple workers need edge/shared rate limiting. The body-length middleware rejects oversized declared `Content-Length`; the reverse proxy must also cap actual streamed bodies. The shared token does not provide user identities, tenant isolation, or per-user quotas. Deploy behind HTTPS, a restrictive network boundary, a shared edge limiter, and managed PostgreSQL backups.
+
+## Known limits
+
+1. The security detector is a small pattern-based harness, not a production prompt-injection defense.
+2. Demo evaluation is a heuristic and must not be interpreted as model-judged quality.
+3. Cache hit savings are estimates; only lookup latency is measured directly. Token cost depends on manually configured pricing assumptions.
+4. Provider behavior is tested with mocked HTTP responses; live credentials, billing, rate limits, and provider model availability require deployment-side validation.
+5. PostgreSQL migrations and behavior have not been validated against a managed production instance.
+6. There is no identity provider, user management, per-tenant data isolation, distributed rate limiter, or cloud deployment manifest.

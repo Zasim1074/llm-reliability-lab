@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 
 const API =
-  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
+  (typeof window === "undefined" ? process.env.INTERNAL_API_BASE_URL : process.env.NEXT_PUBLIC_API_BASE_URL) ||
+  (typeof window === "undefined" ? "http://api:8000/api/v1" : "http://localhost:8000/api/v1");
 const inFlightGets = new Map<string, Promise<unknown>>();
 const nav = [
   "Overview",
@@ -37,6 +38,10 @@ async function api(path: string, init?: RequestInit) {
   const method = (init?.method || "GET").toUpperCase();
   const headers = new Headers(init?.headers);
   headers.set("Accept", "application/json");
+  const accessToken = typeof window === "undefined"
+    ? null
+    : window.sessionStorage.getItem("llm_reliability_access_token");
+  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
   if (init?.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
@@ -47,7 +52,7 @@ async function api(path: string, init?: RequestInit) {
     const response = await fetch(`${API}${path}`, { ...init, method, headers });
     if (!response.ok) {
       const body = await response.json().catch(() => null);
-      throw new Error(body?.detail || `Request failed (${response.status})`);
+      throw new Error(body?.error?.message || body?.detail || `Request failed (${response.status})`);
     }
     return response.status === 204 ? null : response.json();
   })();
@@ -88,12 +93,15 @@ export default function Home() {
   } | null>(null);
   const [prompt, setPrompt] = useState("");
   const [candidate, setCandidate] = useState("");
+  const [alternativeCandidate, setAlternativeCandidate] = useState("");
   const [reference, setReference] = useState("");
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [securityResult, setSecurityResult] = useState<Record<
     string,
     unknown
   > | null>(null);
+  const [runtimeSettings, setRuntimeSettings] = useState<Record<string, unknown> | null>(null);
+  const [accessTokenInput, setAccessTokenInput] = useState("");
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -134,7 +142,6 @@ export default function Home() {
   useEffect(() => {
     if (active !== "Experiment History") return;
     let current = true;
-    setLoading(true);
     api("/experiments?limit=50")
       .then((items) => {
         if (current) setExperiments(items as RecordItem[]);
@@ -145,6 +152,21 @@ export default function Home() {
       })
       .finally(() => {
         if (current) setLoading(false);
+      });
+    return () => {
+      current = false;
+    };
+  }, [active]);
+
+  useEffect(() => {
+    if (active !== "Settings") return;
+    let current = true;
+    api("/settings")
+      .then((value) => {
+        if (current) setRuntimeSettings(value as Record<string, unknown>);
+      })
+      .catch((e: unknown) => {
+        if (current) setError(e instanceof Error ? e.message : "Unable to load settings");
       });
     return () => {
       current = false;
@@ -208,6 +230,8 @@ export default function Home() {
           body: JSON.stringify({
             prompt,
             candidate,
+            alternative_candidate:
+              active === "Bias Testing" ? alternativeCandidate : undefined,
             reference: reference || null,
           }),
         }),
@@ -409,8 +433,8 @@ export default function Home() {
               : "REPRODUCIBLE MEASUREMENTS"
           }
           description={
-            active === "Semantic Cache"
-              ? "Inspect namespace-safe cached responses and test exact or feature-hash similarity matches."
+                active === "Semantic Cache"
+              ? "Inspect namespace-safe cached responses and test exact or provider-embedding similarity matches. Demo mode uses exact matches only."
               : "Compare cache behavior against a disabled baseline using your saved cache entries."
           }
         >
@@ -512,9 +536,8 @@ export default function Home() {
               <div className="disclosure">
                 <span>ⓘ</span>
                 <p>
-                  Demo similarity uses a deterministic feature hash, not a
-                  learned semantic embedding. Configure a real embedding
-                  provider before production semantic matching.
+                  Demo mode matches exact normalized queries only. Configure a
+                  real embedding provider to enable semantic similarity.
                 </p>
               </div>
             </div>
@@ -555,6 +578,16 @@ export default function Home() {
                   placeholder="Paste a model response…"
                 />
               </label>
+              {active === "Bias Testing" && (
+                <label>
+                  Alternative response
+                  <textarea
+                    value={alternativeCandidate}
+                    onChange={(e) => setAlternativeCandidate(e.target.value)}
+                    placeholder="A second answer for the swapped-order comparison…"
+                  />
+                </label>
+              )}
               <label>
                 Reference answer <span className="optional">OPTIONAL</span>
                 <textarea
@@ -565,7 +598,11 @@ export default function Home() {
               </label>
               <button
                 className="button primary"
-                disabled={!prompt.trim() || !candidate.trim()}
+                disabled={
+                  !prompt.trim() ||
+                  !candidate.trim() ||
+                  (active === "Bias Testing" && !alternativeCandidate.trim())
+                }
                 onClick={() => void evaluate()}
               >
                 {active === "Bias Testing"
@@ -714,9 +751,30 @@ export default function Home() {
           <div className="panel readiness">
             <h3>Runtime configuration</h3>
             <Signal label="API" value={API} color="purple" />
-            <Signal label="Mode" value="Demo" color="green" />
-            <Signal label="Database" value="SQLite by default" color="blue" />
-            <Signal label="Cache threshold" value="0.82" color="amber" />
+            <Signal label="Mode" value={runtimeSettings?.demo_mode === false ? "Production" : "Demo"} color="green" />
+            <Signal label="LLM provider" value={String(runtimeSettings?.llm_provider || "Loading…")} color="blue" />
+            <Signal label="Embedding provider" value={String(runtimeSettings?.embedding_provider || "Loading…")} color="amber" />
+            <p className="form-hint">Provider credentials remain on the API server. Demo mode makes no external provider calls.</p>
+          </div>
+          <div className="panel form-panel">
+            <h3>API access</h3>
+            <p>For protected deployments, enter the application access token supplied by the operator. It is stored only in this browser tab.</p>
+            <label>
+              Bearer token
+              <input type="password" autoComplete="off" value={accessTokenInput} onChange={(event) => setAccessTokenInput(event.target.value)} placeholder="APP_ACCESS_TOKEN" />
+            </label>
+            <div className="button-row">
+              <button className="button primary" disabled={!accessTokenInput.trim()} onClick={() => {
+                window.sessionStorage.setItem("llm_reliability_access_token", accessTokenInput.trim());
+                setAccessTokenInput("");
+                void refresh();
+              }}>Connect</button>
+              <button className="button secondary" onClick={() => {
+                window.sessionStorage.removeItem("llm_reliability_access_token");
+                setRuntimeSettings(null);
+                setNotice("API token removed from this tab.");
+              }}>Disconnect</button>
+            </div>
           </div>
           <div className="panel form-panel">
             <h3>Reset demo data</h3>
@@ -734,9 +792,7 @@ export default function Home() {
                 )
                   return;
                 await act(async () => {
-                  await api("/cache", { method: "DELETE" });
-                  await api("/experiments", { method: "DELETE" });
-                  return true;
+                  return api("/settings/demo-data", { method: "DELETE" });
                 }, "Demo data cleared.");
               }}
             >
@@ -772,6 +828,7 @@ export default function Home() {
               key={item}
               className={`nav-item ${active === item ? "active" : ""} ${i === 3 || i === 5 || i === 6 || i === 7 ? "nav-gap" : ""}`}
               onClick={() => {
+                if (item === "Experiment History") setLoading(true);
                 setActive(item);
                 setResult(null);
                 setLookup(null);

@@ -4,6 +4,16 @@ from app.models import CacheEntry
 from app.services import cache_lookup, cache_store, detect_injection, evaluate, run_security
 
 
+class FakeEmbeddingProvider:
+    model_id = "fake-test-model"
+
+    def __init__(self, vectors):
+        self.vectors = vectors
+
+    def embed(self, text):
+        return self.vectors[text]
+
+
 def test_cache_exact_match_and_namespace_isolation(db):
     cache_store(db, "How do I improve reliability?", "Use retries carefully.", "team-a")
     hit = cache_lookup(db, "How do I improve reliability?", "team-a")
@@ -19,6 +29,24 @@ def test_cache_empty_and_expired_entries_are_misses(db):
     db.commit()
     assert cache_lookup(db, "Old question", "default")["hit"] is False
     assert cache_lookup(db, "   ", "default")["hit"] is False
+
+
+def test_demo_cache_does_not_claim_hash_based_semantic_matches(db):
+    cache_store(db, "How does caching work", "Cache answer", "default")
+    result = cache_lookup(db, "How do caches work", "default")
+    assert result["hit"] is False
+    assert result["match_type"] is None
+
+
+def test_configured_embedding_provider_can_match_and_respects_model_identity(db):
+    provider = FakeEmbeddingProvider({"stored query": [1.0, 0.0], "near query": [0.95, 0.05]})
+    cache_store(db, "stored query", "stored answer", "default", embedding_provider=provider)
+    result = cache_lookup(db, "near query", "default", embedding_provider=provider)
+    assert result["hit"] is True
+    assert result["match_type"] == "similarity"
+    other_model = FakeEmbeddingProvider({"near query": [1.0, 0.0]})
+    other_model.model_id = "other-model"
+    assert cache_lookup(db, "near query", "default", embedding_provider=other_model)["hit"] is False
 
 
 def test_evaluation_exposes_heuristic_scores_and_handles_missing_reference():
