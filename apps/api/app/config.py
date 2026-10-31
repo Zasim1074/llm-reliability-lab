@@ -1,7 +1,7 @@
 from typing import Literal, Optional
 from urllib.parse import urlparse
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     llm_output_cost_per_million: Optional[float] = Field(default=None, ge=0)
     estimated_llm_call_cost_usd: float = Field(default=0.002, ge=0)
     openai_base_url_allowed_hosts: list[str] = Field(default_factory=lambda: ["api.openai.com"])
+
+    @field_validator("database_ssl_mode", mode="before")
+    @classmethod
+    def empty_ssl_mode_is_unset(cls, value):
+        return None if value == "" else value
 
     @model_validator(mode="after")
     def validate_runtime(self):

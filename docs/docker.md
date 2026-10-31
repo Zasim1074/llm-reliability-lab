@@ -12,7 +12,7 @@ docker compose config
 docker compose up --build
 ```
 
-Open http://localhost:3000, API docs at http://localhost:8000/docs, liveness at http://localhost:8000/api/v1/health, and database readiness at http://localhost:8000/api/v1/ready. The browser uses `BROWSER_API_BASE_URL` (default `http://localhost:8000/api/v1`); the Next.js server uses `INTERNAL_API_BASE_URL=http://api:8000/api/v1`. `api` is a Compose DNS name and is not reachable from a user's browser. Set both appropriately if the browser and host use another hostname.
+Open http://localhost:3000, API docs at http://localhost:8000/docs, liveness at http://localhost:8000/api/v1/health, and database readiness at http://localhost:8000/api/v1/ready. The browser uses `BROWSER_API_BASE_URL` (default `http://localhost:8000/api/v1`), passed as a public build argument because Next.js embeds `NEXT_PUBLIC_*` values in its browser bundle. Rebuild the web image after changing it. `INTERNAL_API_BASE_URL=http://api:8000/api/v1` is server-side only. `api` is a Compose DNS name and is not reachable from a user's browser.
 
 SQLite is persisted in the named `api_data` volume at `/data/llm_reliability.db`. API migrations are run on startup. The old checked-in SQLite database is excluded from the image; if migrating that file, copy it into the volume using a deliberate backup/migration procedure first. See README migration notes.
 
