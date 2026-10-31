@@ -81,10 +81,50 @@ def test_benchmark_and_bias_experiments_commit_after_flush(api_client):
     benchmark = client.post("/api/v1/benchmarks", json={"query": "benchmark persistence"})
     bias = client.post("/api/v1/bias-tests", json={"prompt": "Explain caching", "candidate": "Caching reduces repeat calls", "alternative_candidate": "Caching can avoid duplicate requests"})
     assert benchmark.status_code == 200
+    disabled = benchmark.json()["metrics"]["modes"]["cache_disabled_estimate"]
+    assert disabled["lookup_latency_ms"] is None
+    assert "no downstream model calls" in disabled["note"]
+    assert benchmark.json()["metrics"]["embedding_input_tokens"] is None
+    assert benchmark.json()["metrics"]["estimated_embedding_cost_usd"] is None
     assert bias.status_code == 200
     with sessionmaker_for(test_engine)() as session:
         assert session.scalar(select(func.count(Experiment.id)).where(Experiment.type == "benchmark")) == 1
         assert session.scalar(select(func.count(Experiment.id)).where(Experiment.type == "bias")) == 1
+
+
+def test_evaluation_accepts_custom_weights_and_rejects_invalid_weights(api_client):
+    client, _ = api_client
+    invalid = client.post("/api/v1/evaluations", json={"prompt": "Only relevance matters", "candidate": "relevance matters", "criteria_weights": {"unknown": 2}})
+    assert invalid.status_code == 422
+    zero = client.post("/api/v1/evaluations", json={"prompt": "Only relevance matters", "candidate": "relevance matters", "criteria_weights": {"relevance": 0}})
+    assert zero.status_code == 422
+    scored = client.post("/api/v1/evaluations", json={"prompt": "Only relevance matters", "candidate": "relevance matters", "criteria_weights": {"relevance": 10}})
+    assert scored.status_code == 200
+    scores = scored.json()["scores"]
+    expected = round((scores["relevance"] * 10 + sum(value for key, value in scores.items() if key != "relevance")) / 14, 1)
+    assert scored.json()["overall"] == expected
+
+
+def test_security_rejects_unknown_case_categories(api_client):
+    client, _ = api_client
+    response = client.post("/api/v1/security/runs", json={"cases": [{"input": "test", "kind": "unknown-category"}]})
+    assert response.status_code == 422
+
+
+def test_provider_rate_limit_is_translated_with_retry_after(api_client):
+    from app.providers import ProviderRateLimited
+
+    client, _ = api_client
+
+    class LimitedProvider:
+        def judge_response(self, *args):
+            raise ProviderRateLimited(9)
+
+    client.app.state.llm_provider = LimitedProvider()
+    response = client.post("/api/v1/evaluations", json={"prompt": "question", "candidate": "answer"})
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "9"
+    assert response.json()["error"]["code"] == "provider_rate_limited"
 
 
 def test_security_result_rolls_back_when_experiment_insert_fails(api_client):
@@ -118,6 +158,7 @@ def test_production_access_requires_bearer_token_but_keeps_health_public(api_cli
     client, _ = api_client
     monkeypatch.setattr(settings, "app_access_token", "t" * 40)
     assert client.get("/api/v1/health").status_code == 200
+    assert client.get("/openapi.json").status_code == 200
     assert client.get("/api/v1/experiments/summary").status_code == 401
     authorized = client.get("/api/v1/experiments/summary", headers={"Authorization": "Bearer " + "t" * 40})
     assert authorized.status_code == 200
@@ -148,10 +189,11 @@ def test_production_configuration_requires_postgresql_and_database_ssl_option():
                           llm_provider="openai", openai_api_key="test",
                           database_url="postgresql+psycopg://user:pass@db:5432/app",
                           database_ssl_mode="require", llm_input_cost_per_million="",
-                          llm_output_cost_per_million="")
+                          llm_output_cost_per_million="", embedding_cost_per_million="")
     assert configured.database_ssl_mode == "require"
     assert configured.llm_input_cost_per_million is None
     assert configured.llm_output_cost_per_million is None
+    assert configured.embedding_cost_per_million is None
 
 
 def test_declared_body_size_limit_returns_request_id(api_client, monkeypatch):
@@ -160,6 +202,15 @@ def test_declared_body_size_limit_returns_request_id(api_client, monkeypatch):
     response = client.post("/api/v1/cache", content=b"x" * 1025, headers={"Content-Type": "application/json"})
     assert response.status_code == 413
     assert response.headers.get("X-Request-ID")
+    assert response.json()["error"]["code"] == "request_too_large"
+
+
+def test_streamed_body_without_content_length_is_also_limited(api_client, monkeypatch):
+    client, _ = api_client
+    monkeypatch.setattr(settings, "request_body_max_bytes", 1024)
+    body = b'{"query":"' + b"x" * 1100 + b'","response":"answer"}'
+    response = client.post("/api/v1/cache", content=iter([body[:400], body[400:]]), headers={"Content-Type": "application/json"})
+    assert response.status_code == 413
     assert response.json()["error"]["code"] == "request_too_large"
 
 

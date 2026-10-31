@@ -13,7 +13,7 @@ docker compose build
 docker compose -p llrl-smoke up --build -d
 ```
 
-Open http://localhost:3000, API docs at http://localhost:8000/docs, liveness at http://localhost:8000/api/v1/health, and database readiness at http://localhost:8000/api/v1/ready. The browser uses `BROWSER_API_BASE_URL` (default `http://localhost:8000/api/v1`), passed as a public build argument because Next.js embeds `NEXT_PUBLIC_*` values in its browser bundle. Rebuild the web image after changing it. `INTERNAL_API_BASE_URL=http://api:8000/api/v1` is server-side only. `api` is a Compose DNS name and is not reachable from a user's browser.
+Open http://localhost:3000, API docs at http://localhost:8000/docs, liveness at http://localhost:8000/api/v1/health, and database readiness at http://localhost:8000/api/v1/ready. The browser uses `BROWSER_API_BASE_URL` (default `http://localhost:8000/api/v1`), passed as a public build argument because Next.js embeds `NEXT_PUBLIC_*` values in its browser bundle. Rebuild the web image after changing it. The current dashboard calls the public API directly, so the host's browser-accessible URL belongs there; a Compose DNS name like `api` cannot be used by the browser.
 
 SQLite is persisted in the named `api_data` volume at `/data/llm_reliability.db`. Both migration and API services mount the same volume; the image prepares `/data` writable by its non-root UID. The old checked-in SQLite database is excluded from the image; if migrating that file, copy it into the volume using a deliberate backup/migration procedure first. See README migration notes.
 
@@ -21,11 +21,13 @@ SQLite is persisted in the named `api_data` volume at `/data/llm_reliability.db`
 
 Add a strong, unique local password as `POSTGRES_PASSWORD` in `.env` and set `DATABASE_URL` to the internal `db` URL, then start the opt-in database profile and its readiness dependency:
 
+The PostgreSQL service is named `db`. Generate a local password with `openssl rand -hex 24`, then set `POSTGRES_PASSWORD` in `.env` and use the same value in `DATABASE_URL=postgresql+psycopg://reliability:<password>@db:5432/reliability` (hex uses URL-safe characters). Keep `DEMO_MODE=true` for local demo behavior. Start an isolated project:
+
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.postgres.yml --profile postgres up --build
+docker compose -p llrl-pg-smoke -f docker-compose.yml -f docker-compose.postgres.yml --profile postgres up --build -d
 ```
 
-The PostgreSQL service is named `db`. Generate a local password with `openssl rand -hex 24`, then set `POSTGRES_PASSWORD` in `.env` and use the same value in `DATABASE_URL=postgresql+psycopg://reliability:<password>@db:5432/reliability` (hex uses URL-safe characters). Keep `DEMO_MODE=true` for local demo behavior. Start an isolated project with `docker compose -p llrl-pg-smoke -f docker-compose.yml -f docker-compose.postgres.yml --profile postgres up --build -d`. The database is persisted in `postgres_data`. Its host port is bound to `127.0.0.1` by default for local tools; do not publish database ports in a production environment.
+The database is persisted in `postgres_data`. Its host port is bound to `127.0.0.1` by default for local tools; do not publish database ports in a production environment.
 
 To keep SQLite and Postgres from sharing one named volume incorrectly, select the database explicitly before startup. Compose environment interpolation example:
 

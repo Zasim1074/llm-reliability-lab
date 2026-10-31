@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from app.models import CacheEntry
-from app.services import cache_lookup, cache_store, detect_injection, evaluate, run_security
+from app.services import cache_lookup, cache_store, cosine, detect_injection, evaluate, run_security
 
 
 class FakeEmbeddingProvider:
@@ -12,6 +12,11 @@ class FakeEmbeddingProvider:
 
     def embed(self, text):
         return self.vectors[text]
+
+
+class FakeUsageEmbeddingProvider(FakeEmbeddingProvider):
+    def embed_with_usage(self, text):
+        return self.embed(text), 7
 
 
 def test_cache_exact_match_and_namespace_isolation(db):
@@ -49,11 +54,34 @@ def test_configured_embedding_provider_can_match_and_respects_model_identity(db)
     assert cache_lookup(db, "near query", "default", embedding_provider=other_model)["hit"] is False
 
 
+def test_cosine_similarity_normalizes_vectors_and_rejects_zero_vectors():
+    assert cosine([10.0, 0.0], [2.0, 0.0]) == 1.0
+    assert cosine([0.0, 0.0], [1.0, 0.0]) == -1.0
+
+
+def test_cache_lookup_reports_provider_embedding_usage_when_available(db):
+    provider = FakeUsageEmbeddingProvider({"stored": [1.0, 0.0], "near": [0.98, 0.02]})
+    cache_store(db, "stored", "answer", "default", embedding_provider=provider)
+    result = cache_lookup(db, "near", "default", embedding_provider=provider)
+    assert result["embedding_input_tokens"] == 7
+
+
 def test_evaluation_exposes_heuristic_scores_and_handles_missing_reference():
     result = evaluate("Explain caching", "Caching can reduce repeated calls", None)
     assert set(result["scores"]) == {"relevance", "correctness", "completeness", "instruction_following", "groundedness"}
     assert result["judge"] == "deterministic_heuristic"
     assert result["overall"] > 0
+
+
+def test_evaluation_criteria_weights_change_only_the_aggregate_score():
+    from app.services import _weighted_overall
+
+    scores = {"relevance": 90, "correctness": 20, "completeness": 40,
+              "instruction_following": 70, "groundedness": 10}
+    balanced = _weighted_overall(scores, None)
+    grounded = _weighted_overall(scores, {"groundedness": 10})
+    assert balanced == 46
+    assert grounded == 22.9
 
 
 def test_security_blocks_injection_and_counts_false_positives():

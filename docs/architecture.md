@@ -1,55 +1,106 @@
-# Architecture and operational boundaries
+# Architecture guide
 
-The project is a modular monolith. Next.js owns presentation and a centralized browser API helper. FastAPI owns validation, request IDs, access-token checks, rate limiting, provider lifecycle, and versioned routes. Use-case functions in `app/services.py` implement cache behavior, scoring, injection classification, and experiment creation. SQLAlchemy models and Alembic own persistence and schema evolution. `app/providers.py` isolates OpenAI HTTP calls from routes.
+The application is a modular monolith with one Next.js dashboard and one FastAPI process. API contracts are under `/api/v1`; use cases live in `apps/api/app/services.py`; external OpenAI HTTP calls are isolated in `providers.py`; SQLAlchemy models use Alembic migrations.
+
+## Frontend
+
+The single dashboard route is `apps/web/src/app/page.tsx`; layout and metadata are in `layout.tsx`, global/responsive styles in `globals.css`, and component/integration behavior in `page.test.tsx`. Navigation changes the active workspace module without a full page load. The `api()` helper adds JSON accept headers, the tab-local bearer token, safe error parsing, and in-flight GET deduplication. History and Settings fetch when opened; summary fetches on initial overview. Saved experiment rows call `/experiments/{id}` and display persisted configuration, metrics, and results.
+
+The browser needs a browser-reachable `NEXT_PUBLIC_API_BASE_URL`; Compose's internal `api` hostname is not available to a user's browser. OpenAI keys, database URLs, and app tokens are never `NEXT_PUBLIC_*` build variables. CSV export uses an authenticated fetch and browser Blob download.
+
+## Backend request lifecycle
 
 ```mermaid
-flowchart LR
-  U[Engineer] --> W[Next.js dashboard]
-  W -->|JSON plus optional bearer token| A[FastAPI]
-  A --> S[Application services]
-  S --> C[Exact cache and provider embeddings]
-  S --> J[Demo rubric or structured LLM judge]
-  S --> R[Pattern-based injection harness]
-  C --> D[(SQLAlchemy persistence)]
-  J --> D
-  R --> D
-  D --> DB[(SQLite local / PostgreSQL hosted)]
-  J -->|configured requests| P[OpenAI API]
-  C -->|configured embeddings| P
+sequenceDiagram
+  participant B as Browser
+  participant F as FastAPI middleware
+  participant R as Route
+  participant S as Service
+  participant P as Provider (optional)
+  participant DB as SQLAlchemy session/database
+  B->>F: HTTP request
+  F->>F: request ID, body limit, auth, process-local rate check
+  F->>R: validated request
+  R->>S: call use-case
+  opt Provider configured
+    S->>P: timed embeddings or structured judge request
+    P-->>S: validated result / safe exception
+  end
+  S->>DB: read/write within request session
+  DB-->>R: records/results
+  R-->>B: JSON and X-Request-ID
 ```
 
-## Important request paths
+`app/main.py` contains versioned routes, lifecycle, middleware, error translation, and JSON request logging. Request logs include request ID, method, route, response status, duration, and exception type; they omit request bodies, authorization headers, provider response details, and environment values. `get_db()` in `db.py` rolls back an uncaught exception and always closes its session. SQLAlchemy errors return a safe 503; provider timeout/rate-limit/upstream failures return safe 504/503/502 responses.
 
-- Cache rows can contain no embedding (exact-only mode) or a provider embedding with a model identifier. Similarity comparisons only use rows created by the currently selected embedding model. Expired and invalidated rows are excluded; SQL candidate retrieval is capped by `CACHE_SCAN_LIMIT`.
-- Evaluation and pairwise bias calls use structured output from the selected provider. Demo mode uses explicit deterministic heuristics. Provider timeouts and upstream failures become safe 504/502 responses; the API does not log request content or provider error bodies.
-- A security run inserts one `SecurityRecord` and one `Experiment` in one database transaction. Session dependencies roll back exceptions and always close sessions.
-- Application logs are JSON request events containing request ID, method, path, status, duration, and exception class. Readiness probes check a database connection; liveness remains independent of the database.
-- Browser GET requests are deduplicated while identical requests are in flight. The initial overview uses the summary endpoint's recent records; history and settings are fetched only when opened.
+## Dependency injection and validation
 
-## API surface
+FastAPI injects `Session` with `Depends(get_db)`. Request schemas in `schemas.py` bound input lengths, case counts, criterion keys/weights, and categories before route logic. `Settings` in `config.py` validates production combinations and provider endpoint allowlists at import/startup. In production (`DEMO_MODE=false`) the shared bearer token and PostgreSQL are required, plus at least one real provider. Health/readiness and the API schema/docs are unauthenticated; data and mutation routes pass through the auth middleware.
 
-- `GET /api/v1/health`, `GET /api/v1/ready`, `GET /api/v1/settings`
-- `POST /api/v1/cache/lookup`, `POST /api/v1/cache`, `GET /api/v1/cache/stats`, `DELETE /api/v1/cache`, `DELETE /api/v1/cache/{entry_id}`
-- `POST /api/v1/benchmarks`
-- `POST /api/v1/evaluations`, `GET /api/v1/evaluations`, `GET /api/v1/evaluations/export?format=json|csv&limit=200&offset=0`
-- `POST /api/v1/bias-tests`
-- `GET /api/v1/security/sample-cases`, `POST /api/v1/security/runs`
-- `GET /api/v1/experiments`, `GET /api/v1/experiments/summary`, `GET /api/v1/experiments/{id}`, `DELETE /api/v1/experiments`, `DELETE /api/v1/experiments/{id}`
-- `DELETE /api/v1/settings/demo-data`
+## Database design
 
-FastAPI publishes OpenAPI at `/docs` and `/openapi.json`. Non-demo API routes require a shared bearer token. Health and readiness endpoints are exempt so infrastructure probes can access them.
+`models.py` defines:
 
-## Schema and operations
+- `CacheEntry`: normalized text, namespace, optional vector, embedding model/dimension identity, TTL, and invalidation flag.
+- `Experiment`: unified run type/name/status/configuration/metrics/results/timestamps.
+- `EvaluationRecord`: prompt/reference/candidate, criterion scores, aggregate, timestamp.
+- `SecurityRecord`: case and attack outcome counts plus full run results.
 
-Alembic revision `0001_initial` creates the original schema. `0002_provider_cache` allows exact-only cache entries and adds embedding model provenance. Existing unversioned databases must be backed up, verified against revision 0001, stamped at that revision, and upgraded. Production startup does not call `create_all`; it fails fast if the cache schema is outdated. Local demo startup creates missing SQLite tables only.
+Experiments also retain result payloads so history works across cache benchmark, evaluation, bias, and security workflows. Security/evaluation result records and their experiment rows are inserted in the same transaction. The migrations are `0001_initial` and `0002_provider_cache`; fresh installs use `alembic upgrade head`. Legacy unversioned data must be backed up and verified against `0001_initial` before stamping. Startup does not auto-upgrade or reset schemas; it fails fast on the known old cache schema. SQLite remains supported for development; PostgreSQL URLs are normalized to psycopg and optional SSL mode is applied by `db.py`.
 
-The application limiter is bounded but process-local. Multiple workers need edge/shared rate limiting. The body-length middleware rejects oversized declared `Content-Length`; the reverse proxy must also cap actual streamed bodies. The shared token does not provide user identities, tenant isolation, or per-user quotas. Deploy behind HTTPS, a restrictive network boundary, a shared edge limiter, and managed PostgreSQL backups.
+## Semantic caching
 
-## Known limits
+```mermaid
+flowchart TD
+  Q[Query + namespace] --> N[Normalize query]
+  N --> X{Exact active row?}
+  X -- yes --> H[Return exact response]
+  X -- no --> E{Embedding provider and compatible rows?}
+  E -- no --> M[Miss; demo is exact-only]
+  E -- yes --> V[Embed query]
+  V --> C[Cosine score same-model/same-dimension vectors]
+  C --> T{Score >= configured threshold?}
+  T -- yes --> S[Return semantic response]
+  T -- no --> M
+```
 
-1. The security detector is a small pattern-based harness, not a production prompt-injection defense.
-2. Demo evaluation is a heuristic and must not be interpreted as model-judged quality.
-3. Cache hit savings are estimates; only lookup latency is measured directly. Token cost depends on manually configured pricing assumptions.
-4. Provider behavior is tested with mocked HTTP responses; live credentials, billing, rate limits, and provider model availability require deployment-side validation.
-5. PostgreSQL migrations and behavior have not been validated against a managed production instance.
-6. There is no identity provider, user management, per-tenant data isolation, distributed rate limiter, or cloud deployment manifest.
+`services.cache_store()` generates a vector only when a real embedding provider was passed. `cache_lookup()` filters namespace, TTL, invalidation, and scan limit; exact matching is tried before embeddings. Provider identity includes embedding model and dimensions; incompatible old vectors are skipped. `cosine()` normalizes vectors and rejects size mismatch/zero vectors. OpenAI implementation is `OpenAIProvider.embed()` in `providers.py`. Tests inject fake vectors; those are test doubles, not a real provider verification.
+
+The benchmark route runs a small fixed query set against the configured cache and measures lookup wall time. It computes an exact-only comparison locally. It does not run an LLM for the cache-disabled counterfactual: disabled downstream calls, avoided calls, and avoided cost are estimates; only cache lookup time is measured. Embedding token usage is included when the provider returns it; embedding cost uses the separate `EMBEDDING_COST_PER_MILLION` assumption. Judge and embedding prices are estimates, not provider invoices.
+
+## Evaluation and bias flow
+
+`POST /evaluations` accepts prompt/candidate/reference and optional criterion weights. The weights are validated and normalize the aggregate across five criteria. `services.evaluate()` uses `OpenAIProvider.judge_response()` when configured; strict JSON-schema response is checked by Pydantic `JudgeScores`. Otherwise it returns explicitly labeled lexical demo scores. The explanation/rationale, model/judge identity, usage (for provider calls), estimated configured token cost, and scores are stored in experiment results.
+
+`POST /bias-tests` makes pairwise decisions in original and swapped candidate order, then repeats candidate scoring. It reports selection stability, candidate word counts, and score variation. These few calls are descriptive probes, not statistically supported bias measurements. Demo decisions use a lexical rule and are labeled as such.
+
+## Security harness flow
+
+`GET /security/sample-cases` returns four example inputs. `POST /security/runs` accepts 1–100 validated categories/cases; the dashboard also accepts a custom JSON list. `services.matching_injection_rules()` reports which small configured regex patterns matched; `run_security()` compares pattern outcomes against the case's supplied malicious label, calculates false positives/negatives, and stores explanations with one `SecurityRecord` and one `Experiment` atomically.
+
+The harness does not call a protected model/RAG pipeline, does not execute retrieved text, and has no comprehensive adversarial corpus. A no-match result is explicitly not evidence that input is safe. It is a test harness only.
+
+## Experiment lifecycle
+
+```mermaid
+stateDiagram-v2
+  [*] --> RequestValidated
+  RequestValidated --> ServiceExecution
+  ServiceExecution --> ProviderCall: configured external model
+  ProviderCall --> Persistence
+  ServiceExecution --> Persistence: deterministic/demo or cache path
+  Persistence --> Completed: transaction commit
+  Persistence --> RolledBack: exception/failed transaction
+  Completed --> [*]
+  RolledBack --> [*]
+```
+
+Routes create an `Experiment`, flush/commit with their related result records, then return IDs. Errors do not get persisted as failed experiments currently; transaction failures roll back all rows for that request. Listing is paginated/bounded, summary uses aggregate queries, and detail returns one saved run. Browser row selection fetches detail on demand.
+
+## Operational limits
+
+- Shared static bearer token: no identities, tenant isolation, token expiry/rotation workflow, or per-user quotas.
+- Rate limiter is in-memory per worker; configure shared edge limiting before multiple instances.
+- Middleware enforces streamed request size; reverse proxy should also cap request sizes and durations.
+- External OpenAI and PostgreSQL behavior are not live-verified by automated tests.
+- See [deployment.md](deployment.md), [docker.md](docker.md), and [troubleshooting.md](troubleshooting.md) for operations.

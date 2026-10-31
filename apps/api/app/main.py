@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import Base, engine, get_db
 from app.models import CacheEntry, EvaluationRecord, Experiment, SecurityRecord
-from app.providers import OpenAIProvider, ProviderError, ProviderTimeout
+from app.providers import OpenAIProvider, ProviderError, ProviderRateLimited, ProviderTimeout
 from app.schemas import (
     CacheLookupRequest,
     CacheStoreRequest,
@@ -147,7 +147,9 @@ def readiness(db: Session = Depends(get_db)):
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
     request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
-    exempt = request.method == "OPTIONS" or request.url.path in {"/api/v1/health", "/api/v1/ready"}
+    exempt = request.method == "OPTIONS" or request.url.path in {
+        "/api/v1/health", "/api/v1/ready", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect",
+    }
     status_code = 500
     started = time.perf_counter()
     content_length = request.headers.get("content-length")
@@ -162,7 +164,23 @@ async def request_id_middleware(request: Request, call_next):
         if not allowed:
             response = JSONResponse(status_code=429, content={"error": {"code": "rate_limited", "message": "Request limit exceeded; retry later", "request_id": request.state.request_id}}, headers={"Retry-After": str(retry_after)})
         else:
-            response = await call_next(request)
+            body = bytearray()
+            too_large = False
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > settings.request_body_max_bytes:
+                    too_large = True
+                    break
+            if too_large:
+                response = JSONResponse(status_code=413, content={"error": {"code": "request_too_large", "message": "Request body exceeds the configured size limit", "request_id": request.state.request_id}})
+            else:
+                request._body = bytes(body)
+
+                async def replay_body():
+                    return {"type": "http.request", "body": request._body, "more_body": False}
+
+                request._receive = replay_body
+                response = await call_next(request)
     status_code = response.status_code
     response.headers["X-Request-ID"] = request.state.request_id
     logger.info("http_request", extra={"event": "http_request", "request_id": request.state.request_id,
@@ -202,6 +220,13 @@ async def http_error_handler(request: Request, exc: HTTPException):
 @app.exception_handler(ProviderTimeout)
 async def provider_timeout_handler(request: Request, _: ProviderTimeout):
     return _error(request, 504, "provider_timeout", "The configured AI provider timed out")
+
+
+@app.exception_handler(ProviderRateLimited)
+async def provider_rate_limit_handler(request: Request, exc: ProviderRateLimited):
+    response = _error(request, 503, "provider_rate_limited", "The configured AI provider is temporarily rate limited")
+    response.headers["Retry-After"] = str(exc.retry_after_seconds)
+    return response
 
 
 @app.exception_handler(ProviderError)
@@ -295,10 +320,11 @@ def invalidate_cache_entry(entry_id: str, db: Session = Depends(get_db)):
 @app.post("/api/v1/benchmarks")
 def benchmark(payload: CacheLookupRequest, request: Request, db: Session = Depends(get_db)):
     dataset = [payload.query, payload.query + " ", "Explain a reliable cache design", "What is cache invalidation?"]
-    latencies, hits, exact, similarity = [], 0, 0, 0
+    latencies, embedding_usages, hits, exact, similarity = [], [], 0, 0, 0
     for query in dataset:
         result = cache_lookup(db, query, payload.namespace, request.app.state.embedding_provider)
         latencies.append(result["latency_ms"])
+        embedding_usages.append(result.get("embedding_input_tokens"))
         if result["hit"]:
             hits += 1
             if result["match_type"] == "exact": exact += 1
@@ -312,34 +338,47 @@ def benchmark(payload: CacheLookupRequest, request: Request, db: Session = Depen
         started = time.perf_counter()
         exact_hits += int(any(row.normalized_query == normalize(query) for row in active_entries))
         exact_latencies.append((time.perf_counter() - started) * 1000)
-    disabled_hits = 0
+    embedding_input_tokens = sum(embedding_usages) if embedding_usages and all(value is not None for value in embedding_usages) else None
+    estimated_embedding_cost = (
+        round(embedding_input_tokens * settings.embedding_cost_per_million / 1_000_000, 8)
+        if embedding_input_tokens is not None and settings.embedding_cost_per_million is not None else None
+    )
     metrics = {"total_requests": len(dataset), "cache_hits": hits, "cache_misses": len(dataset) - hits,
                "exact_hits": exact, "similarity_hits": similarity, "hit_rate": round(hits / len(dataset) * 100, 1),
-               "modes": {"disabled": {"hits": disabled_hits, "hit_rate": 0, "simulated_llm_calls": len(dataset), "average_lookup_latency_ms": 0},
+               "modes": {"cache_disabled_estimate": {"cache_lookup_performed": False,
+                                                       "estimated_downstream_calls": len(dataset),
+                                                       "lookup_latency_ms": None,
+                                                       "note": "Bypass behavior is estimated; no downstream model calls were made."},
                          "exact": {"hits": exact_hits, "hit_rate": round(exact_hits / len(dataset) * 100, 1),
-                                   "simulated_llm_calls": len(dataset) - exact_hits,
+                                   "estimated_downstream_calls": len(dataset) - exact_hits,
                                    "average_lookup_latency_ms": round(sum(exact_latencies) / len(exact_latencies), 3),
                                    "median_lookup_latency_ms": round(sorted(exact_latencies)[(len(exact_latencies)-1)//2], 3)},
-                         "similarity": {"hits": hits, "hit_rate": round(hits / len(dataset) * 100, 1),
-                                        "simulated_llm_calls": len(dataset) - hits,
+                         "configured_cache": {"hits": hits, "hit_rate": round(hits / len(dataset) * 100, 1),
+                                        "estimated_downstream_calls": len(dataset) - hits,
                                         "average_lookup_latency_ms": round(sum(latencies) / len(latencies), 3),
                                         "median_lookup_latency_ms": round((ordered[(len(ordered)-1)//2] + ordered[len(ordered)//2]) / 2, 3)}},
                "average_lookup_latency_ms": round(sum(latencies) / len(latencies), 3),
                "median_lookup_latency_ms": round((ordered[(len(ordered)-1)//2] + ordered[len(ordered)//2]) / 2, 3),
-               "llm_calls_with_cache": len(dataset) - hits, "llm_calls_without_cache": len(dataset),
+               "estimated_downstream_calls_with_cache": len(dataset) - hits,
+               "estimated_downstream_calls_without_cache": len(dataset),
                "estimated_avoided_calls": hits,
                "estimated_cost_avoided_usd": round(hits * settings.estimated_llm_call_cost_usd, 4),
                "cost_assumption_usd_per_call": settings.estimated_llm_call_cost_usd,
-               "measurement_note": "Lookup latency measured locally; avoided calls and cost are estimates."}
-    exp = create_experiment(db, "benchmark", "Semantic cache benchmark", {"namespace": payload.namespace, "cache_mode": "similarity"}, metrics, {"queries": dataset})
+               "embedding_input_tokens": embedding_input_tokens,
+               "estimated_embedding_cost_usd": estimated_embedding_cost,
+               "measurement_note": "Cache lookup latency is measured locally. Cache-disabled downstream calls and avoided cost are estimates; no LLM request was made by this benchmark. Embedding input token usage is reported only when returned by the configured provider, with cost estimated from the separate embedding price setting."}
+    exp = create_experiment(db, "benchmark", "Semantic cache benchmark",
+                            {"namespace": payload.namespace,
+                             "cache_mode": "exact_and_similarity" if settings.embedding_provider == "openai" else "exact_only"},
+                            metrics, {"queries": dataset})
     db.commit()
-    db.refresh(exp)
     return {"experiment_id": exp.id, "metrics": metrics}
 
 
 @app.post("/api/v1/evaluations")
 def evaluation(payload: EvaluationRequest, request: Request, db: Session = Depends(get_db)):
-    result = evaluate(payload.prompt, payload.candidate, payload.reference, request.app.state.llm_provider)
+    result = evaluate(payload.prompt, payload.candidate, payload.reference, request.app.state.llm_provider,
+                      payload.criteria_weights)
     usage = result.get("usage")
     estimated_cost = _estimate_llm_cost(usage) if usage else None
     if estimated_cost is not None:
@@ -347,12 +386,11 @@ def evaluation(payload: EvaluationRequest, request: Request, db: Session = Depen
     record = EvaluationRecord(prompt=payload.prompt, reference=payload.reference, candidate=payload.candidate,
                               scores=result["scores"], overall=result["overall"])
     db.add(record)
-    exp = create_experiment(db, "evaluation", "Response quality evaluation", {"judge": result["judge"]},
+    exp = create_experiment(db, "evaluation", "Response quality evaluation",
+                            {"judge": result["judge"], "criteria_weights": result["criteria_weights"]},
                             {"overall_score": result["overall"], "criteria": result["scores"],
                              "estimated_cost_usd": estimated_cost}, result)
     db.commit()
-    db.refresh(record)
-    db.refresh(exp)
     return {"id": record.id, "experiment_id": exp.id, **result}
 
 
@@ -393,8 +431,8 @@ def bias_test(payload: EvaluationRequest, request: Request, db: Session = Depend
     candidate_b_wins = original["winner"] == "B" and swapped["winner"] == "A"
     follows_first_position = original["winner"] == "A" and swapped["winner"] == "A"
     follows_second_position = original["winner"] == "B" and swapped["winner"] == "B"
-    repeat_a = evaluate(payload.prompt, payload.candidate, payload.reference, judge)
-    repeat_b = evaluate(payload.prompt, payload.candidate, payload.reference, judge)
+    repeat_a = evaluate(payload.prompt, payload.candidate, payload.reference, judge, payload.criteria_weights)
+    repeat_b = evaluate(payload.prompt, payload.candidate, payload.reference, judge, payload.criteria_weights)
     first_words = len(payload.candidate.split())
     second_words = len(payload.alternative_candidate.split())
     result = {"position_bias": {"original_order": original, "swapped_order": swapped,
@@ -417,7 +455,6 @@ def bias_test(payload: EvaluationRequest, request: Request, db: Session = Depend
         result["estimated_cost_usd"] = cost
     exp = create_experiment(db, "bias", "Judge bias diagnostic", {"judge": repeat_a["judge"]}, result, result)
     db.commit()
-    db.refresh(exp)
     return {"experiment_id": exp.id, **result}
 
 
@@ -437,8 +474,6 @@ def security_run(payload: SecurityRunRequest, db: Session = Depends(get_db)):
     db.add(record)
     exp = create_experiment(db, "security", payload.name, {"mitigation": payload.mitigation}, data["metrics"], data)
     db.commit()
-    db.refresh(record)
-    db.refresh(exp)
     return {"id": record.id, "experiment_id": exp.id, **data}
 
 

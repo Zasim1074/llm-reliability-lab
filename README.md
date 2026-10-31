@@ -1,30 +1,58 @@
 # LLM Reliability Lab
 
-A local-first engineering lab for measuring cache behavior, scoring LLM responses, and testing prompt-injection defenses. It runs in an explicitly labeled demo mode without provider credentials, or can use the OpenAI API for embeddings and structured LLM judging. Experiments persist in SQLite locally; PostgreSQL is supported for hosted deployments.
+LLM Reliability Lab is a small engineering workspace for testing semantic-cache behavior, judging model responses, comparing answers for bias signals, and exercising a prompt-injection harness. It is a local-first modular monolith built with Next.js, FastAPI, SQLAlchemy, and Alembic.
 
-## Capabilities and limits
+> This is an engineering/evaluation MVP. Demo scoring is a transparent lexical heuristic; the security harness is pattern-based. Neither is a factuality or security guarantee.
 
-- **Semantic cache:** namespace isolation, exact lookup, TTL expiry, invalidation, provider-backed embedding similarity, and bounded lookup scans. Demo mode performs exact matching only; it does not create synthetic semantic vectors.
-- **Evaluation lab:** deterministic heuristic scoring in demo mode, or structured rubric scoring through the configured LLM provider.
-- **Bias diagnostics:** paired candidate order swaps and repeated scoring. Results are diagnostics, not statistical evidence.
-- **RAG security:** controlled pattern-based injection harness. Retrieved text is not executed; this is not a security guarantee or a substitute for testing a real application.
-- **Experiment history:** persisted metrics, configuration, and result payloads.
+## Screenshots
 
-Estimated avoided calls and costs are estimates. Provider cost estimates are shown only when both token prices are configured. The application uses a single shared bearer token, not individual accounts, workspace isolation, or enterprise identity.
+<!-- Add current screenshots here after running the app locally. -->
 
-## Requirements
+## Features
 
-- Python 3.11 or newer (the API dependencies and code are targeted at Python 3.11+).
-- Node.js 20 or newer and npm.
-- PostgreSQL for a multi-user or hosted deployment. SQLite is intended for local demo/testing.
+- **Semantic cache and benchmarks:** namespace isolation, exact matching in demo mode, OpenAI embeddings for configured semantic matching, TTL/invalidation, bounded candidate scans, measured local lookup time and provider-reported embedding token use, plus explicitly estimated avoided calls/cost.
+- **Evaluation and bias diagnostics:** schema-validated OpenAI judge outputs or clearly labeled deterministic demo scores, configurable criterion weights, candidate order swaps, and repeated scoring.
+- **RAG security harness:** sample and custom test cases, heuristic matched-rule explanations, false-positive/negative counts, saved results, and visible coverage limitations.
+- **Unified experiments:** benchmark, evaluation, bias, and security runs are saved to shared history with detail views for metrics and results.
+- **Settings and operations:** runtime provider status, browser-tab bearer token entry, cache/data reset, health/readiness endpoints, and JSON request logs that omit prompts and credentials.
 
-## Local demo
+## Architecture
+
+```mermaid
+flowchart LR
+  B[Browser / Next.js] -->|JSON and bearer token| A[FastAPI]
+  A --> S[Services]
+  S --> C[Cache + cosine similarity]
+  S --> E[Evaluation + bias]
+  S --> R[Injection test harness]
+  C --> D[(SQLAlchemy models)]
+  E --> D
+  R --> D
+  D --> DB[(SQLite local / PostgreSQL)]
+  C -. configured embedding .-> O[OpenAI API]
+  E -. configured judge .-> O
+```
+
+See [docs/architecture.md](docs/architecture.md) for request lifecycles and data models.
+
+## Technology
+
+- Python 3.11+; FastAPI, Pydantic v2, SQLAlchemy 2, Alembic, HTTPX, psycopg 3.
+- Node.js 20+; Next.js, React, TypeScript, Vitest, Testing Library.
+- SQLite for local development/tests; PostgreSQL for hosted deployment.
+- Docker Compose with SQLite by default and opt-in local PostgreSQL.
+
+## Start locally
+
+Detailed commands are in [docs/setup.md](docs/setup.md). Quick path:
 
 ```bash
 cd apps/api
+cp -n .env.example .env
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
@@ -36,67 +64,29 @@ npm ci
 npm run dev
 ```
 
-Open http://localhost:3000. The API docs are at http://localhost:8000/docs. Local demo mode creates missing SQLite tables, but does not alter existing tables. Apply migrations explicitly before hosted use.
-
-## Configuration
-
-Copy `apps/api/.env.example` to `apps/api/.env` and `apps/web/.env.example` to `apps/web/.env.local`. The API loads `.env` from its working directory, so deployment commands should run from `apps/api` or set environment variables directly.
-
-| Variable | Purpose |
-| --- | --- |
-| `DATABASE_URL` | SQLAlchemy URL. Hosted PostgreSQL URL forms are normalized to `postgresql+psycopg`. |
-| `DEMO_MODE` | `true` selects deterministic local demo behavior; `false` requires an access token and at least one real provider. |
-| `APP_ACCESS_TOKEN` | Shared bearer token, at least 32 characters. Keep it in the hosting secret store. Enter it in Settings in each browser tab. |
-| `CORS_ORIGINS` | Comma-separated exact frontend origins. Do not use `*` for hosted deployments. |
-| `LLM_PROVIDER` | `demo` or `openai`; OpenAI is used for evaluation and pairwise judging. |
-| `EMBEDDING_PROVIDER` | `demo` (exact-only cache) or `openai` (semantic similarity). |
-| `OPENAI_API_KEY` | Server-side secret, required for each selected OpenAI provider. Never expose it to the browser. |
-| `OPENAI_CHAT_MODEL` | OpenAI model used for structured judging. |
-| `OPENAI_EMBEDDING_MODEL` / `OPENAI_EMBEDDING_DIMENSIONS` | Embedding model and vector size; changing these creates a distinct vector space. |
-| `CACHE_SIMILARITY_THRESHOLD` / `CACHE_SCAN_LIMIT` | Similarity cutoff and maximum candidate rows examined. |
-| `RATE_LIMIT_*` | Bounded process-local request limit. Configure an edge/shared limiter for multiple workers. |
-| `REQUEST_BODY_MAX_BYTES` | Maximum accepted declared request content length. Enforce actual streamed body size at the reverse proxy too. |
-| `LLM_INPUT_COST_PER_MILLION` / `LLM_OUTPUT_COST_PER_MILLION` | Optional pricing assumptions for usage-based estimates. |
-
-Set `DEMO_MODE=false`, a strong `APP_ACCESS_TOKEN`, and one or both real providers to enable production-mode API behavior. OpenAI requests are sent server-side with a timeout; prompts and credentials are not included in application request logs. Use the default HTTPS provider host unless you have explicitly reviewed and configured a compatible endpoint.
-
-## Database migrations
-
-For a fresh database:
-
-```bash
-cd apps/api
-alembic upgrade head
-```
-
-For an existing legacy database created by the earlier `create_all` application, first stop the API and make a tested backup. Verify that the existing tables match revision `0001_initial` (especially `cache_entries`), then:
-
-```bash
-cd apps/api
-alembic stamp 0001_initial
-alembic upgrade head
-```
-
-Revision `0002_provider_cache` makes cache embeddings nullable and adds `embedding_model`. The API checks for those columns at startup and fails with a migration instruction if a legacy schema is detected. Do not stamp a database whose schema has not been verified. Never run this migration against the checked-in local database without backing it up first.
-
-## Deploying
-
-This repository contains deployment configuration guidance, not a completed cloud deployment. Use a managed PostgreSQL database with network/TLS restrictions and automated backups. Keep database/provider/access-token secrets in the platform secret manager. Run migrations as a one-off release step before starting the API; do not run migrations independently from every API worker. Start the backend from `apps/api`:
-
-```bash
-alembic upgrade head
-uvicorn app.main:app --host 0.0.0.0 --port "$PORT" --workers 1
-```
-
-Use a reverse proxy or platform edge to terminate HTTPS, cap actual request body size, apply shared rate limits, and restrict inbound traffic. The built-in limiter is process-local and will not enforce a shared quota across workers/instances. Until a distributed limiter and user-scoped authorization are deployed, treat this as a small trusted-team tool behind network access controls. The API bearer token is shared by all users and does not provide per-user audit attribution.
-
-For the web app, set `NEXT_PUBLIC_API_BASE_URL` to the HTTPS API origin plus `/api/v1` before building. Set the exact web origin in API `CORS_ORIGINS`. Build and serve with Node.js 20+.
+Use `http://localhost:3000`; API health and docs are at `http://localhost:8000/api/v1/health` and `http://localhost:8000/docs`. The API example points to a new `llm_reliability_local.db` file so it does not silently alter the checked-in legacy database.
 
 ## Docker
 
-Docker Compose setup and test instructions are in [docs/docker.md](docs/docker.md). Local SQLite startup uses `docker compose up --build`; optional PostgreSQL uses `docker compose -f docker-compose.yml -f docker-compose.postgres.yml --profile postgres up --build`. The Compose setup and images have not been executed in this environment because Docker is unavailable here.
+```bash
+cp -n .env.example .env
+docker compose config
+docker compose up --build
+```
 
-## Verification
+The default stack persists a separate SQLite database in a named volume. Use [docs/docker.md](docs/docker.md) for optional PostgreSQL, checks, data persistence, and safe reset instructions. Docker is unavailable in the implementation environment; images and container behavior have not been verified here.
+
+## Configuration and providers
+
+API secrets are server-side only. To use OpenAI, set `LLM_PROVIDER=openai` and/or `EMBEDDING_PROVIDER=openai` and provide `OPENAI_API_KEY` in the API environment. Demo mode must be `false` to select hosted providers; it then requires a 32+ character `APP_ACCESS_TOKEN` and PostgreSQL `DATABASE_URL`. The browser only receives `NEXT_PUBLIC_API_BASE_URL`, never provider or database credentials.
+
+Configuration examples are in `apps/api/.env.example`, root `.env.example` (Compose), and `apps/web/.env.example`. Detailed local setup is in [docs/setup.md](docs/setup.md).
+
+## Database and existing data
+
+For a fresh database, run `alembic upgrade head`. Never stamp an existing SQLite database without backing it up and verifying its schema against revision `0001_initial`; legacy local databases may require `alembic stamp 0001_initial` followed by `alembic upgrade head`. The API fails fast when it detects an outdated cache schema. Full migration guidance is in [docs/setup.md](docs/setup.md) and [docs/docker.md](docs/docker.md).
+
+## Tests
 
 ```bash
 cd apps/api
@@ -107,15 +97,22 @@ npm run lint
 npm run build
 ```
 
-The test suite uses SQLite and mocked provider HTTP responses. It does not verify live OpenAI credentials, managed PostgreSQL, or a cloud deployment.
+Provider HTTP is mocked in automated tests. No live OpenAI calls, managed PostgreSQL, Docker runtime, Playwright E2E suite, or cloud deployment were verified. TypeScript checking runs as part of `next build`; there is no standalone typecheck script.
 
-## Demo walkthrough
+## Future deployment layout
 
-1. Store and look up an answer in Semantic Cache. Demo mode demonstrates exact-match behavior; configure an embedding provider for semantic matching.
-2. Run a cache benchmark and distinguish measured local latency from estimated avoided calls/cost.
-3. Score a candidate in Evaluation Lab. Demo results are deterministic heuristic scores.
-4. Compare two candidates in Bias Testing; the output describes order swaps and repeated judging limitations.
-5. Run the sample cases in RAG Security and inspect attack outcomes.
-6. Use Experiment History to browse saved runs. Settings can reset local demo data.
+The documented target is a static/container Next.js frontend (Vercel or a container host), FastAPI in Docker on AWS EC2, Supabase PostgreSQL, OpenAI from the backend, and HTTPS termination at a reverse proxy/ingress. No AWS resources were created and no deployment has occurred. Read [docs/deployment.md](docs/deployment.md) before configuring a hosted environment.
 
-See [docs/architecture.md](docs/architecture.md) for API boundaries and operational limitations.
+## Known limitations
+
+- One shared bearer token is not user identity, workspace isolation, or per-user audit logging.
+- The built-in rate limiter is process-local; use shared edge limits for multiple instances. Put the app behind HTTPS and network access controls.
+- The request middleware limits streamed bodies, but a reverse proxy should also enforce body/time limits.
+- Cache-disabled downstream calls and avoided cost are estimates; the benchmark does not send LLM requests. Lookup latency is measured locally.
+- Embedding token usage is reported only when the provider returns usage; embedding cost is an estimate based on the separate `EMBEDDING_COST_PER_MILLION` setting.
+- Demo evaluation is lexical and the security harness checks a small pattern set. Test the actual application/RAG pipeline before relying on results.
+- Provider responses are mocked in tests; live credentials/model availability, managed PostgreSQL behavior, Docker and cloud deployment remain to be verified.
+
+## Learning path
+
+Start with [docs/learning-guide.md](docs/learning-guide.md), then use the file-by-file [architecture guide](docs/architecture.md). Common failures and fixes are in [docs/troubleshooting.md](docs/troubleshooting.md).

@@ -14,6 +14,12 @@ class ProviderTimeout(ProviderError):
     pass
 
 
+class ProviderRateLimited(ProviderError):
+    def __init__(self, retry_after_seconds: int = 5):
+        super().__init__("Provider rate limit exceeded")
+        self.retry_after_seconds = retry_after_seconds
+
+
 class ProviderInvalidResponse(ProviderError):
     pass
 
@@ -81,10 +87,10 @@ class OpenAIProvider:
         timeout_seconds: float,
         client: Optional[httpx.Client] = None,
     ):
-        self.model_id = chat_model
         self.chat_model = chat_model
         self.embedding_model = embedding_model
         self.embedding_dimensions = embedding_dimensions
+        self.model_id = f"{embedding_model}:{embedding_dimensions}"
         self._client = client or httpx.Client(
             base_url=base_url.rstrip("/") + "/",
             headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
@@ -97,6 +103,10 @@ class OpenAIProvider:
             self._client.close()
 
     def embed(self, text: str) -> list[float]:
+        vector, _ = self.embed_with_usage(text)
+        return vector
+
+    def embed_with_usage(self, text: str) -> tuple[list[float], Optional[int]]:
         response = self._post(
             "embeddings",
             {"model": self.embedding_model, "input": text, "dimensions": self.embedding_dimensions, "encoding_format": "float"},
@@ -108,7 +118,9 @@ class OpenAIProvider:
             values = [float(value) for value in vector]
             if any(not math.isfinite(value) for value in values):
                 raise ProviderInvalidResponse("Embedding response contains invalid values")
-            return values
+            usage = response.get("usage", {})
+            token_count = usage.get("prompt_tokens", usage.get("input_tokens")) if isinstance(usage, dict) else None
+            return values, int(token_count) if token_count is not None else None
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             if isinstance(exc, ProviderInvalidResponse):
                 raise
@@ -201,6 +213,13 @@ class OpenAIProvider:
             raise ProviderTimeout("Provider request timed out") from exc
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
+            if status == 429:
+                raw_retry = exc.response.headers.get("Retry-After", "5")
+                try:
+                    retry_after = min(300, max(1, int(raw_retry)))
+                except ValueError:
+                    retry_after = 5
+                raise ProviderRateLimited(retry_after) from exc
             raise ProviderError("Provider rejected the request" if status < 500 else "Provider is unavailable") from exc
         except httpx.RequestError as exc:
             raise ProviderError("Provider could not be reached") from exc

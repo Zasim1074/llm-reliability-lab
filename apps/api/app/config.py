@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     provider_timeout_seconds: float = Field(default=30, gt=0, le=180)
     llm_input_cost_per_million: Optional[float] = Field(default=None, ge=0)
     llm_output_cost_per_million: Optional[float] = Field(default=None, ge=0)
+    embedding_cost_per_million: Optional[float] = Field(default=None, ge=0)
     estimated_llm_call_cost_usd: float = Field(default=0.002, ge=0)
     openai_base_url_allowed_hosts: list[str] = Field(default_factory=lambda: ["api.openai.com"])
 
@@ -42,7 +43,7 @@ class Settings(BaseSettings):
     def empty_ssl_mode_is_unset(cls, value):
         return None if value == "" else value
 
-    @field_validator("llm_input_cost_per_million", "llm_output_cost_per_million", mode="before")
+    @field_validator("llm_input_cost_per_million", "llm_output_cost_per_million", "embedding_cost_per_million", mode="before")
     @classmethod
     def empty_cost_is_unset(cls, value):
         return None if value == "" else value

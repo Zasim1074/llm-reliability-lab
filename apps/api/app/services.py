@@ -21,7 +21,11 @@ def cosine(left: list[float], right: list[float]) -> float:
         return -1.0
     if any(not math.isfinite(value) for value in left + right):
         return -1.0
-    return sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return -1.0
+    return sum(a * b for a, b in zip(left, right)) / (left_norm * right_norm)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -37,9 +41,12 @@ def create_experiment(db: Session, kind: str, name: str, config: dict, metrics: 
 
 def cache_lookup(db: Session, query: str, namespace: str, embedding_provider: Optional[EmbeddingProvider] = None) -> dict:
     started = time.perf_counter()
+    usage_supported = embedding_provider is not None and callable(getattr(embedding_provider, "embed_with_usage", None))
+    embedding_input_tokens = 0 if usage_supported else None
     norm_query = normalize(query)
     if not norm_query:
-        return {"hit": False, "match_type": None, "score": 0, "response": None, "latency_ms": 0}
+        return {"hit": False, "match_type": None, "score": 0, "response": None,
+                "latency_ms": 0, "embedding_input_tokens": embedding_input_tokens}
     now = datetime.now(timezone.utc)
     entries = db.scalars(
         select(CacheEntry)
@@ -53,7 +60,10 @@ def cache_lookup(db: Session, query: str, namespace: str, embedding_provider: Op
         match, score = exact, 1.0
         match_type = "exact"
     elif embedding_provider and any(entry.embedding is not None and entry.embedding_model == embedding_provider.model_id for entry in entries):
-        query_vec = embedding_provider.embed(norm_query)
+        if usage_supported:
+            query_vec, embedding_input_tokens = embedding_provider.embed_with_usage(norm_query)
+        else:
+            query_vec = embedding_provider.embed(norm_query)
         scored = [(cosine(query_vec, entry.embedding), entry) for entry in entries
                   if entry.embedding is not None and entry.embedding_model == embedding_provider.model_id]
         score, match = max(scored, default=(-1.0, None), key=lambda item: item[0])
@@ -68,6 +78,7 @@ def cache_lookup(db: Session, query: str, namespace: str, embedding_provider: Op
         "score": round(score, 4) if match else max(0, round(score, 4)),
         "response": match.response if match else None,
         "latency_ms": round((time.perf_counter() - started) * 1000, 3),
+        "embedding_input_tokens": embedding_input_tokens,
     }
 
 
@@ -82,13 +93,16 @@ def cache_store(db: Session, query: str, response: str, namespace: str, ttl_seco
                         expires_at=datetime.now(timezone.utc) + timedelta(seconds=ttl))
     db.add(record)
     db.commit()
-    db.refresh(record)
     return record
 
 
-def evaluate(prompt: str, candidate: str, reference: Optional[str], judge_provider: Optional[JudgeProvider] = None) -> dict:
+def evaluate(prompt: str, candidate: str, reference: Optional[str], judge_provider: Optional[JudgeProvider] = None,
+             criteria_weights: Optional[dict[str, float]] = None) -> dict:
     if judge_provider:
-        return judge_provider.judge_response(prompt, candidate, reference)
+        result = judge_provider.judge_response(prompt, candidate, reference)
+        result["overall"] = _weighted_overall(result["scores"], criteria_weights)
+        result["criteria_weights"] = _normalized_weights(result["scores"], criteria_weights)
+        return result
     candidate_words = set(re.findall(r"[a-z0-9]+", candidate.lower()))
     prompt_words = set(re.findall(r"[a-z0-9]+", prompt.lower()))
     reference_words = set(re.findall(r"[a-z0-9]+", (reference or "").lower()))
@@ -99,9 +113,26 @@ def evaluate(prompt: str, candidate: str, reference: Optional[str], judge_provid
     correctness = groundedness if reference else 0.5
     scores = {"relevance": relevance, "correctness": correctness, "completeness": completeness,
               "instruction_following": instruction, "groundedness": groundedness}
-    return {"scores": {key: round(value * 100, 1) for key, value in scores.items()},
-            "overall": round(sum(scores.values()) / len(scores) * 100, 1),
+    percent_scores = {key: round(value * 100, 1) for key, value in scores.items()}
+    return {"scores": percent_scores,
+            "overall": _weighted_overall(percent_scores, criteria_weights),
+            "criteria_weights": _normalized_weights(percent_scores, criteria_weights),
             "judge": "deterministic_heuristic", "limitations": "Lexical demo rubric; not an LLM judgment or factuality guarantee."}
+
+
+def _normalized_weights(scores: dict[str, float], configured: Optional[dict[str, float]]) -> dict[str, float]:
+    weights = {key: (configured or {}).get(key, 1.0) for key in scores}
+    total = sum(weights.values())
+    if total <= 0:
+        return {key: 0.0 for key in scores}
+    return {key: round(weight / total, 4) for key, weight in weights.items()}
+
+
+def _weighted_overall(scores: dict[str, float], configured: Optional[dict[str, float]]) -> float:
+    weights = _normalized_weights(scores, configured)
+    if not any(weights.values()):
+        return 0.0
+    return round(sum(scores[key] * weight for key, weight in weights.items()), 1)
 
 
 def compare_pair(prompt: str, candidate_a: str, candidate_b: str,
@@ -120,26 +151,38 @@ def compare_pair(prompt: str, candidate_a: str, candidate_b: str,
             "rationale": "Rule-based lexical scores were compared; this is not an LLM judgment."}
 
 
-INJECTION_PATTERNS = [r"ignore (all )?(previous|prior|system) instructions", r"reveal (the )?(system prompt|hidden instructions)",
-                      r"override (the )?(system|safety) instructions", r"send .* (password|secret|api key)",
-                      r"run (this|the) (command|code)"]
+INJECTION_PATTERNS = {
+    "instruction_override": r"ignore (all )?(previous|prior|system) instructions",
+    "secret_disclosure": r"reveal (the )?(system prompt|hidden instructions)",
+    "safety_override": r"override (the )?(system|safety) instructions",
+    "secret_exfiltration": r"send .* (password|secret|api key)",
+    "command_execution": r"run (this|the) (command|code)",
+}
+
+
+def matching_injection_rules(text: str) -> list[str]:
+    lowered = text.lower()
+    return [rule for rule, pattern in INJECTION_PATTERNS.items() if re.search(pattern, lowered)]
 
 
 def detect_injection(text: str) -> bool:
-    return any(re.search(pattern, text.lower()) for pattern in INJECTION_PATTERNS)
+    return bool(matching_injection_rules(text))
 
 
 def run_security(cases: list[dict], mitigation: bool) -> dict:
     results, blocked, successful, fp, fn = [], 0, 0, 0, 0
     for index, case in enumerate(cases, 1):
-        detected = detect_injection(case["input"])
+        matched_rules = matching_injection_rules(case["input"])
+        detected = bool(matched_rules)
         is_blocked = detected and mitigation
         if case["malicious"] and is_blocked: blocked += 1
         if case["malicious"] and not is_blocked: successful += 1
         if not case["malicious"] and detected: fp += 1
         if case["malicious"] and not detected: fn += 1
-        results.append({"case": index, "kind": case["kind"], "detected": detected, "blocked": is_blocked,
-                        "outcome": "blocked" if is_blocked else "allowed", "input": case["input"]})
+        results.append({"case": index, "kind": case["kind"], "detected": detected, "matched_rules": matched_rules,
+                        "risk": "high" if detected else "unclassified",
+                        "explanation": ("Matched harness rules: " + ", ".join(matched_rules)) if detected else "No configured pattern matched; this is not evidence the input is safe.",
+                        "blocked": is_blocked, "outcome": "blocked" if is_blocked else "allowed", "input": case["input"]})
     malicious_count = sum(1 for case in cases if case["malicious"])
     return {"results": results, "metrics": {"total_cases": len(cases), "blocked_attacks": blocked,
             "successful_attacks": successful, "false_positives": fp, "false_negatives": fn,

@@ -3,8 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 const API =
-  (typeof window === "undefined" ? process.env.INTERNAL_API_BASE_URL : process.env.NEXT_PUBLIC_API_BASE_URL) ||
-  (typeof window === "undefined" ? "http://api:8000/api/v1" : "http://localhost:8000/api/v1");
+  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
 const inFlightGets = new Map<string, Promise<unknown>>();
 const nav = [
   "Overview",
@@ -22,7 +21,14 @@ type RecordItem = {
   name: string;
   status: string;
   started_at: string;
-  metrics: Record<string, number | string>;
+  metrics?: Record<string, unknown>;
+};
+type ExperimentDetail = RecordItem & {
+  configuration: Record<string, unknown>;
+  metrics: Record<string, unknown>;
+  results: Record<string, unknown>;
+  error: string | null;
+  completed_at: string;
 };
 type Summary = {
   total_experiments: number;
@@ -66,6 +72,23 @@ async function api(path: string, init?: RequestInit) {
   }
 }
 
+async function downloadEvaluationCsv() {
+  const headers = new Headers({ Accept: "text/csv" });
+  const token = window.sessionStorage.getItem("llm_reliability_access_token");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const response = await fetch(`${API}/evaluations/export?format=csv`, { headers });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.error?.message || `Export failed (${response.status})`);
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "evaluations.csv";
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function Icon({ children }: { children: React.ReactNode }) {
   return (
     <span className="icon" aria-hidden="true">
@@ -78,7 +101,14 @@ export default function Home() {
   const [active, setActive] = useState("Overview");
   const [summary, setSummary] = useState<Summary | null>(null);
   const [experiments, setExperiments] = useState<RecordItem[]>([]);
+  const [historyOffset, setHistoryOffset] = useState(0);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [selectedExperimentId, setSelectedExperimentId] = useState<string | null>(null);
+  const [selectedExperiment, setSelectedExperiment] = useState<ExperimentDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [mutationPending, setMutationPending] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [query, setQuery] = useState("");
@@ -94,6 +124,13 @@ export default function Home() {
   const [prompt, setPrompt] = useState("");
   const [candidate, setCandidate] = useState("");
   const [alternativeCandidate, setAlternativeCandidate] = useState("");
+  const [criteriaWeights, setCriteriaWeights] = useState({
+    relevance: 1,
+    correctness: 1,
+    completeness: 1,
+    instruction_following: 1,
+    groundedness: 1,
+  });
   const [reference, setReference] = useState("");
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [securityResult, setSecurityResult] = useState<Record<
@@ -102,6 +139,7 @@ export default function Home() {
   > | null>(null);
   const [runtimeSettings, setRuntimeSettings] = useState<Record<string, unknown> | null>(null);
   const [accessTokenInput, setAccessTokenInput] = useState("");
+  const [customSecurityCases, setCustomSecurityCases] = useState("");
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -142,9 +180,14 @@ export default function Home() {
   useEffect(() => {
     if (active !== "Experiment History") return;
     let current = true;
-    api("/experiments?limit=50")
+    api("/experiments?limit=50&offset=0")
       .then((items) => {
-        if (current) setExperiments(items as RecordItem[]);
+        if (current) {
+          const rows = items as RecordItem[];
+          setExperiments(rows);
+          setHistoryOffset(rows.length);
+          setHistoryHasMore(rows.length === 50);
+        }
       })
       .catch((e: unknown) => {
         if (current)
@@ -173,11 +216,64 @@ export default function Home() {
     };
   }, [active]);
 
+  useEffect(() => {
+    if (!selectedExperimentId) return;
+    let current = true;
+    api(`/experiments/${encodeURIComponent(selectedExperimentId)}`)
+      .then((detail) => {
+        if (current) setSelectedExperiment(detail as ExperimentDetail);
+      })
+      .catch((e: unknown) => {
+        if (current) setError(e instanceof Error ? e.message : "Unable to load experiment details");
+      })
+      .finally(() => {
+        if (current) setDetailLoading(false);
+      });
+    return () => { current = false; };
+  }, [selectedExperimentId]);
+
+  const openExperiment = (id: string) => {
+    setActive("Experiment History");
+    setDetailLoading(true);
+    setSelectedExperiment(null);
+    setSelectedExperimentId(id);
+  };
+
+  const loadMoreExperiments = async () => {
+    if (historyLoading || !historyHasMore) return;
+    setHistoryLoading(true);
+    try {
+      const rows = await api(`/experiments?limit=50&offset=${historyOffset}`) as RecordItem[];
+      setExperiments((current) => [...current, ...rows]);
+      setHistoryOffset((current) => current + rows.length);
+      setHistoryHasMore(rows.length === 50);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to load more experiments");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const connectToken = async () => {
+    const token = accessTokenInput.trim();
+    window.sessionStorage.setItem("llm_reliability_access_token", token);
+    setAccessTokenInput("");
+    setError("");
+    try {
+      setRuntimeSettings(await api("/settings") as Record<string, unknown>);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to connect with this token");
+    }
+  };
+
   const act = async (
     action: () => Promise<unknown>,
     message: string,
     refreshSummary = true,
   ) => {
+    if (mutationPending) return;
+    setMutationPending(true);
     setError("");
     setNotice("");
     try {
@@ -188,6 +284,17 @@ export default function Home() {
       if (refreshSummary) await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "The operation failed");
+    } finally {
+      setMutationPending(false);
+    }
+  };
+
+  const exportEvaluations = async () => {
+    setError("");
+    try {
+      await downloadEvaluationCsv();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to export evaluations");
     }
   };
 
@@ -233,6 +340,7 @@ export default function Home() {
             alternative_candidate:
               active === "Bias Testing" ? alternativeCandidate : undefined,
             reference: reference || null,
+            criteria_weights: active === "Evaluation Lab" ? criteriaWeights : undefined,
           }),
         }),
       active === "Bias Testing"
@@ -240,7 +348,19 @@ export default function Home() {
         : "Evaluation saved.",
     );
   const runSecurity = async () => {
-    const cases = await api("/security/sample-cases");
+    let cases: unknown;
+    if (customSecurityCases.trim()) {
+      try {
+        cases = JSON.parse(customSecurityCases);
+      } catch {
+        throw new Error("Custom security cases must be valid JSON.");
+      }
+      if (!Array.isArray(cases) || cases.length === 0 || cases.length > 100) {
+        throw new Error("Provide between 1 and 100 security cases in a JSON array.");
+      }
+    } else {
+      cases = await api("/security/sample-cases");
+    }
     const r = await api("/security/runs", {
       method: "POST",
       body: JSON.stringify({
@@ -250,8 +370,7 @@ export default function Home() {
       }),
     });
     setSecurityResult(r);
-    setNotice("Security harness run completed.");
-    await refresh();
+    return r;
   };
 
   const renderContent = () => {
@@ -278,7 +397,7 @@ export default function Home() {
                   Explore cache <span>→</span>
                 </button>
                 <span className="provider">
-                  <i /> Demo providers active
+                  <i /> Providers configured on API
                 </span>
               </div>
             </div>
@@ -286,10 +405,9 @@ export default function Home() {
               <div className="orb orb-one" />
               <div className="orb orb-two" />
               <div className="signal-card">
-                <span className="signal-label">SYSTEM STATUS</span>
+                  <span className="signal-label">RELIABILITY WORKSPACE</span>
                 <strong>
-                  <i />
-                  Operational
+                    Engineering lab
                 </strong>
                 <div className="signal-line">
                   <span />
@@ -305,7 +423,7 @@ export default function Home() {
                   <span />
                   <span />
                 </div>
-                <small>Demo mode · local database</small>
+                <small>Run and inspect experiments</small>
               </div>
             </div>
             <div className="grid-glow" />
@@ -356,7 +474,7 @@ export default function Home() {
                   : `${summary.average_cache_latency_ms} ms`
               }
               icon="◷"
-              sub="Measured locally"
+              sub="Measured by API"
               tone="amber"
             />
           </section>
@@ -367,14 +485,12 @@ export default function Home() {
                   <h3>Recent activity</h3>
                   <p>Your latest engineering runs</p>
                 </div>
-                <span className="live-pill">
-                  <i /> LIVE
-                </span>
+                <span className="live-pill">SAVED</span>
               </div>
               {summary?.recent?.length ? (
                 <div className="activity-list">
                   {summary.recent.map((item) => (
-                    <Activity key={item.id} item={item} />
+                    <Activity key={item.id} item={item} onClick={() => openExperiment(item.id)} />
                   ))}
                 </div>
               ) : (
@@ -435,7 +551,7 @@ export default function Home() {
           description={
                 active === "Semantic Cache"
               ? "Inspect namespace-safe cached responses and test exact or provider-embedding similarity matches. Demo mode uses exact matches only."
-              : "Compare cache behavior against a disabled baseline using your saved cache entries."
+              : "Measure cache hits and local lookup latency. A cache-disabled downstream baseline is estimated; this benchmark does not make LLM calls."
           }
         >
           <div className="two-col">
@@ -445,7 +561,7 @@ export default function Home() {
                   ? "Cache playground"
                   : "Run benchmark"}
               </h3>
-              <p>Inputs are processed by the local demo API.</p>
+              <p>Inputs are processed by the API provider configuration shown in Settings.</p>
               <label>
                 Query
                 <textarea
@@ -467,7 +583,7 @@ export default function Home() {
                   <div className="button-row">
                     <button
                       className="button primary"
-                      disabled={!query.trim()}
+                      disabled={!query.trim() || mutationPending}
                       onClick={() =>
                         void act(runCache, "Cache lookup complete.", false)
                       }
@@ -485,7 +601,7 @@ export default function Home() {
                   </label>
                   <button
                     className="button secondary"
-                    disabled={!query.trim() || !response.trim()}
+                    disabled={!query.trim() || !response.trim() || mutationPending}
                     onClick={() => void storeAnswer()}
                   >
                     Store response
@@ -494,6 +610,7 @@ export default function Home() {
               ) : (
                 <button
                   className="button primary"
+                  disabled={mutationPending}
                   onClick={() => void runBenchmark()}
                 >
                   Run benchmark <span>→</span>
@@ -522,7 +639,7 @@ export default function Home() {
                   </div>
                   <div className="result-stats">
                     <span>
-                      Similarity score <b>{lookup.score}</b>
+                      Match score <b>{lookup.score}</b>
                     </span>
                     <span>
                       Lookup latency <b>{lookup.latency_ms} ms</b>
@@ -536,8 +653,8 @@ export default function Home() {
               <div className="disclosure">
                 <span>ⓘ</span>
                 <p>
-                  Demo mode matches exact normalized queries only. Configure a
-                  real embedding provider to enable semantic similarity.
+                  Exact normalized matches are checked first. Semantic matches
+                  require a configured embedding provider; demo mode is exact-only.
                 </p>
               </div>
             </div>
@@ -551,8 +668,8 @@ export default function Home() {
           eyebrow="QUALITY ENGINEERING"
           description={
             active === "Bias Testing"
-              ? "Probe position, verbosity, and repeatability behavior with the deterministic demo judge."
-              : "Score candidate responses against a transparent rule-based rubric and save results."
+              ? "Compare candidate order and repeated scores using the configured judge. Small samples are diagnostic, not statistical evidence."
+              : "Score candidate responses with the API-configured judge. Demo mode uses a transparent lexical rubric; criterion weights control the aggregate score."
           }
         >
           <div className="two-col">
@@ -596,11 +713,35 @@ export default function Home() {
                   placeholder="Provide a reference for groundedness and correctness"
                 />
               </label>
+              {active === "Evaluation Lab" && (
+                <fieldset className="criteria-weights">
+                  <legend>Criterion weights (0–10)</legend>
+                  {Object.entries(criteriaWeights).map(([criterion, weight]) => (
+                    <label key={criterion}>
+                      {criterion.replaceAll("_", " ")}
+                      <input
+                        aria-label={`${criterion.replaceAll("_", " ")} weight`}
+                        type="number"
+                        min="0"
+                        max="10"
+                        step="0.5"
+                        value={weight}
+                        onChange={(event) => setCriteriaWeights((current) => ({
+                          ...current,
+                          [criterion]: Number(event.target.value),
+                        }))}
+                      />
+                    </label>
+                  ))}
+                </fieldset>
+              )}
               <button
                 className="button primary"
                 disabled={
                   !prompt.trim() ||
                   !candidate.trim() ||
+                  mutationPending ||
+                  (active === "Evaluation Lab" && Object.values(criteriaWeights).every((weight) => weight === 0)) ||
                   (active === "Bias Testing" && !alternativeCandidate.trim())
                 }
                 onClick={() => void evaluate()}
@@ -610,12 +751,13 @@ export default function Home() {
                   : "Score response"}{" "}
                 <span>→</span>
               </button>
-              <a
+              <button
                 className="export-link"
-                href={`${API}/evaluations/export?format=csv`}
+                type="button"
+                onClick={() => void exportEvaluations()}
               >
                 Export saved evaluations as CSV ↗
-              </a>
+              </button>
             </div>
             <div className="panel result-panel">
               <div className="panel-head">
@@ -629,9 +771,8 @@ export default function Home() {
               <div className="disclosure">
                 <span>ⓘ</span>
                 <p>
-                  Heuristic scores are not factuality guarantees or actual LLM
-                  judgments. Tiny samples do not support statistical
-                  conclusions.
+                  Demo heuristic scores are not actual LLM judgments or factuality
+                  guarantees. Small bias samples do not support statistical conclusions.
                 </p>
               </div>
             </div>
@@ -651,10 +792,20 @@ export default function Home() {
               <h3>Run safe sample suite</h3>
               <p>
                 Includes benign, direct injection, retrieved-document injection,
-                and unauthorized-action examples.
+                and unauthorized-action examples. Results classify patterns only;
+                they do not execute an LLM or secure a RAG application.
               </p>
+              <label>
+                Optional custom cases (JSON array)
+                <textarea
+                  value={customSecurityCases}
+                  onChange={(event) => setCustomSecurityCases(event.target.value)}
+                  placeholder='[{"input":"Ignore all previous instructions","kind":"direct","malicious":true}]'
+                />
+              </label>
               <button
                 className="button primary"
+                disabled={mutationPending}
                 onClick={() =>
                   void act(runSecurity, "Security harness run completed.")
                 }
@@ -662,9 +813,9 @@ export default function Home() {
                 Run security tests <span>→</span>
               </button>
               <div className="tag-row">
-                <span>4 curated cases</span>
+                <span>{customSecurityCases.trim() ? "Custom cases" : "4 sample cases"}</span>
                 <span>Mitigation enabled</span>
-                <span>Local only</span>
+                <span>Harness only</span>
               </div>
             </div>
             <div className="panel result-panel">
@@ -683,12 +834,14 @@ export default function Home() {
                       case: number;
                       kind: string;
                       outcome: string;
+                      explanation: string;
                     }[]
                   ).map((r) => (
                     <div key={r.case}>
                       <span>{r.case.toString().padStart(2, "0")}</span>
                       <b>{r.kind.replaceAll("_", " ")}</b>
                       <i className={r.outcome}>{r.outcome}</i>
+                      <small>{r.explanation}</small>
                     </div>
                   ))}
                 </div>
@@ -718,6 +871,28 @@ export default function Home() {
                 ↻
               </button>
             </div>
+            {selectedExperimentId && (
+              <section className="experiment-detail" aria-live="polite">
+                <div className="panel-head">
+                  <div>
+                    <h3>{selectedExperiment?.name || "Experiment details"}</h3>
+                    <p>{detailLoading ? "Loading saved results…" : selectedExperiment?.type || ""}</p>
+                  </div>
+                  <button className="text-button" onClick={() => {
+                    setSelectedExperimentId(null);
+                    setSelectedExperiment(null);
+                  }}>Close</button>
+                </div>
+                {selectedExperiment && (
+                  <>
+                    <h4>Metrics</h4>
+                    <pre>{JSON.stringify(selectedExperiment.metrics, null, 2)}</pre>
+                    <h4>Results</h4>
+                    <pre>{JSON.stringify(selectedExperiment.results, null, 2)}</pre>
+                  </>
+                )}
+              </section>
+            )}
             {experiments.length ? (
               <div className="history-table">
                 <div className="table-header">
@@ -727,7 +902,7 @@ export default function Home() {
                   <span>DATE</span>
                 </div>
                 {experiments.map((e) => (
-                  <Activity key={e.id} item={e} />
+                  <Activity key={e.id} item={e} onClick={() => openExperiment(e.id)} />
                 ))}
               </div>
             ) : (
@@ -738,6 +913,11 @@ export default function Home() {
                 onClick={() => setActive("Semantic Cache")}
               />
             )}
+            {historyHasMore && (
+              <button className="button secondary" disabled={historyLoading} onClick={() => void loadMoreExperiments()}>
+                {historyLoading ? "Loading…" : "Load more experiments"}
+              </button>
+            )}
           </div>
         </Module>
       );
@@ -745,13 +925,13 @@ export default function Home() {
       <Module
         title="Settings"
         eyebrow="WORKSPACE CONFIGURATION"
-        description="The demo uses local deterministic providers. Configure environment values on the API host for deployment."
+        description="Provider mode is set by the API operator. Demo mode uses local deterministic behavior; configure provider environment values on the API host."
       >
         <div className="two-col">
           <div className="panel readiness">
             <h3>Runtime configuration</h3>
             <Signal label="API" value={API} color="purple" />
-            <Signal label="Mode" value={runtimeSettings?.demo_mode === false ? "Production" : "Demo"} color="green" />
+            <Signal label="Mode" value={runtimeSettings ? (runtimeSettings.demo_mode === false ? "Production" : "Demo") : "Unavailable"} color="green" />
             <Signal label="LLM provider" value={String(runtimeSettings?.llm_provider || "Loading…")} color="blue" />
             <Signal label="Embedding provider" value={String(runtimeSettings?.embedding_provider || "Loading…")} color="amber" />
             <p className="form-hint">Provider credentials remain on the API server. Demo mode makes no external provider calls.</p>
@@ -764,11 +944,7 @@ export default function Home() {
               <input type="password" autoComplete="off" value={accessTokenInput} onChange={(event) => setAccessTokenInput(event.target.value)} placeholder="APP_ACCESS_TOKEN" />
             </label>
             <div className="button-row">
-              <button className="button primary" disabled={!accessTokenInput.trim()} onClick={() => {
-                window.sessionStorage.setItem("llm_reliability_access_token", accessTokenInput.trim());
-                setAccessTokenInput("");
-                void refresh();
-              }}>Connect</button>
+              <button className="button primary" disabled={!accessTokenInput.trim()} onClick={() => void connectToken()}>Connect</button>
               <button className="button secondary" onClick={() => {
                 window.sessionStorage.removeItem("llm_reliability_access_token");
                 setRuntimeSettings(null);
@@ -777,13 +953,14 @@ export default function Home() {
             </div>
           </div>
           <div className="panel form-panel">
-            <h3>Reset demo data</h3>
+            <h3>Reset workspace data</h3>
             <p>
-              Invalidates all stored cache entries and removes experiment
-              history. This cannot be undone.
+              Removes cached responses and saved evaluation, security, and
+              experiment records. Use only for disposable or backed-up data.
             </p>
             <button
               className="button danger"
+              disabled={mutationPending}
               onClick={async () => {
                 if (
                   !window.confirm(
@@ -845,10 +1022,8 @@ export default function Home() {
         </nav>
         <div className="sidebar-bottom">
           <div className="demo-box">
-            <div>
-              <i /> DEMO MODE
-            </div>
-            <p>Local providers are active. No API key needed.</p>
+            <div>API CONFIGURATION</div>
+            <p>Check provider mode and access details in Settings.</p>
             <button onClick={() => setActive("Settings")}>
               Configure providers <span>→</span>
             </button>
@@ -857,9 +1032,8 @@ export default function Home() {
             <div className="avatar">LL</div>
             <div>
               <b>Lab workspace</b>
-              <small>Local environment</small>
+              <small>Current API workspace</small>
             </div>
-            <button aria-label="Workspace menu">···</button>
           </div>
         </div>
       </aside>
@@ -869,9 +1043,9 @@ export default function Home() {
             Workspace <span>/</span> <b>{active}</b>
           </div>
           <div className="top-actions">
-            <span className="connected">
-              <i /> API connected
-            </span>
+            <a className="connected" href={`${API}/ready`} target="_blank" rel="noreferrer">
+              API readiness ↗
+            </a>
             <button
               className="icon-button"
               onClick={() => void refresh()}
@@ -879,9 +1053,9 @@ export default function Home() {
             >
               ↻
             </button>
-            <button className="help-button">
+            <a className="help-button" href={`${API.replace("/api/v1", "")}/docs`} target="_blank" rel="noreferrer">
               ? <span>Help</span>
-            </button>
+            </a>
           </div>
         </header>
         <div className="content">
@@ -908,10 +1082,10 @@ export default function Home() {
           )}
           <footer>
             <span>
-              RELIABILITY LAB <i /> DEMO BUILD
+              RELIABILITY LAB
             </span>
             <span>
-              Metrics from local experiments ·{" "}
+              Metrics from saved experiments ·{" "}
               <a
                 href={`${API.replace("/api/v1", "")}/docs`}
                 target="_blank"
@@ -952,7 +1126,7 @@ function Metric({
     </div>
   );
 }
-function Activity({ item }: { item: RecordItem }) {
+function Activity({ item, onClick }: { item: RecordItem; onClick: () => void }) {
   const colors: Record<string, string> = {
     benchmark: "blue",
     evaluation: "violet",
@@ -960,7 +1134,7 @@ function Activity({ item }: { item: RecordItem }) {
     security: "red",
   };
   return (
-    <div className="activity-row">
+    <button className="activity-row" onClick={onClick} aria-label={`View experiment ${item.name}`}>
       <div className={`activity-icon ${colors[item.type] || "blue"}`}>
         {item.type === "security"
           ? "⌑"
@@ -978,7 +1152,7 @@ function Activity({ item }: { item: RecordItem }) {
       </div>
       <span className={`status ${item.status}`}>{item.status}</span>
       <span className="row-arrow">↗</span>
-    </div>
+    </button>
   );
 }
 function Signal({
@@ -1065,6 +1239,9 @@ function Result({ value }: { value: Record<string, unknown> | null }) {
       : typeof metrics.overall_score === "number"
         ? metrics.overall_score
         : null;
+  const note = [value.limitation, value.measurement_note, value.rationale]
+    .filter((item): item is string => typeof item === "string")
+    .join(" ");
   const keyLabels: Record<string, string> = {
     total_requests: "Total requests",
     cache_hits: "Cache hits",
@@ -1073,7 +1250,11 @@ function Result({ value }: { value: Record<string, unknown> | null }) {
     average_lookup_latency_ms: "Average lookup latency",
     median_lookup_latency_ms: "Median lookup latency",
     estimated_avoided_calls: "Estimated avoided calls",
+    estimated_downstream_calls_with_cache: "Estimated downstream calls with cache",
+    estimated_downstream_calls_without_cache: "Estimated downstream calls without cache",
     estimated_cost_avoided_usd: "Estimated cost avoided",
+    embedding_input_tokens: "Embedding input tokens",
+    estimated_embedding_cost_usd: "Estimated embedding cost",
     blocked_attacks: "Blocked attacks",
     successful_attacks: "Successful attacks",
     attack_success_rate: "Attack success rate",
@@ -1141,8 +1322,8 @@ function Result({ value }: { value: Record<string, unknown> | null }) {
       {!scores && !simple.length && (
         <pre className="json-result">{JSON.stringify(value, null, 2)}</pre>
       )}
-      {typeof value.limitation === "string" && (
-        <p className="result-note">{value.limitation}</p>
+      {note && (
+        <p className="result-note">{note}</p>
       )}
     </div>
   );
