@@ -147,8 +147,11 @@ def test_production_configuration_requires_postgresql_and_database_ssl_option():
     configured = Settings(_env_file=None, demo_mode=False, app_access_token="x" * 40,
                           llm_provider="openai", openai_api_key="test",
                           database_url="postgresql+psycopg://user:pass@db:5432/app",
-                          database_ssl_mode="require")
+                          database_ssl_mode="require", llm_input_cost_per_million="",
+                          llm_output_cost_per_million="")
     assert configured.database_ssl_mode == "require"
+    assert configured.llm_input_cost_per_million is None
+    assert configured.llm_output_cost_per_million is None
 
 
 def test_declared_body_size_limit_returns_request_id(api_client, monkeypatch):

@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     def empty_ssl_mode_is_unset(cls, value):
         return None if value == "" else value
 
+    @field_validator("llm_input_cost_per_million", "llm_output_cost_per_million", mode="before")
+    @classmethod
+    def empty_cost_is_unset(cls, value):
+        return None if value == "" else value
+
     @model_validator(mode="after")
     def validate_runtime(self):
         if not self.demo_mode:

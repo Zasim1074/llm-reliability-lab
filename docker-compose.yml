@@ -1,18 +1,30 @@
 name: llm-reliability-lab
 
 services:
+  migrate:
+    build:
+      context: ./apps/api
+    init: true
+    restart: "no"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////data/llm_reliability.db}
+      DATABASE_SSL_MODE: ${DATABASE_SSL_MODE:-}
+    volumes:
+      - api_data:/data
+    command: ["alembic", "upgrade", "head"]
+
   api:
     build:
       context: ./apps/api
     init: true
     restart: unless-stopped
-    env_file:
-      - path: ./.env
-        required: false
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite:////data/llm_reliability.db}
       DATABASE_SSL_MODE: ${DATABASE_SSL_MODE:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      CACHE_SIMILARITY_THRESHOLD: ${CACHE_SIMILARITY_THRESHOLD:-0.82}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-86400}
+      CACHE_SCAN_LIMIT: ${CACHE_SCAN_LIMIT:-2000}
       DEMO_MODE: ${DEMO_MODE:-true}
       APP_ACCESS_TOKEN: ${APP_ACCESS_TOKEN:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-demo}
@@ -23,13 +35,22 @@ services:
       OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
       OPENAI_EMBEDDING_DIMENSIONS: ${OPENAI_EMBEDDING_DIMENSIONS:-1536}
       PROVIDER_TIMEOUT_SECONDS: ${PROVIDER_TIMEOUT_SECONDS:-30}
+      LLM_INPUT_COST_PER_MILLION: ${LLM_INPUT_COST_PER_MILLION:-}
+      LLM_OUTPUT_COST_PER_MILLION: ${LLM_OUTPUT_COST_PER_MILLION:-}
+      ESTIMATED_LLM_CALL_COST_USD: ${ESTIMATED_LLM_CALL_COST_USD:-0.002}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_POOL_TIMEOUT_SECONDS: ${DB_POOL_TIMEOUT_SECONDS:-30}
+      DB_POOL_RECYCLE_SECONDS: ${DB_POOL_RECYCLE_SECONDS:-1800}
       RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-120}
       RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+      RATE_LIMIT_CLIENT_CAPACITY: ${RATE_LIMIT_CLIENT_CAPACITY:-10000}
       REQUEST_BODY_MAX_BYTES: ${REQUEST_BODY_MAX_BYTES:-1000000}
     volumes:
       - api_data:/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8000}:8000"
     healthcheck:
@@ -38,7 +59,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
-    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 
   web:
     build:
